@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const runAsCLI = "MAILGLO_TEST_RUN_AS_CLI"
@@ -39,8 +41,8 @@ const testToken = "mgp_test-secret-token-value"
 const unroutable = "http://192.0.2.1"
 
 type recorded struct {
-	Method, Path, RawQuery, Auth, ContentType, IdempotencyKey string
-	Body                                                      []byte
+	Method, Path, RawQuery, Auth, ContentType, IdempotencyKey, Cookie string
+	Body                                                              []byte
 }
 
 type fakeServer struct {
@@ -50,9 +52,12 @@ type fakeServer struct {
 	etag       string
 	lastMod    string
 	specStatus int // non-zero: answer the description request with this status
-	specGets   []http.Header
-	calls      []recorded
-	respond    func(w http.ResponseWriter, r *http.Request)
+	// specRedirect, when set, redirects /api/openapi.json there; the
+	// description is also served at any other path ending in openapi.json.
+	specRedirect string
+	specGets     []http.Header
+	calls        []recorded
+	respond      func(w http.ResponseWriter, r *http.Request)
 }
 
 // newFakeServer starts a server; configure runs before it accepts requests.
@@ -69,8 +74,12 @@ func newFakeServer(t *testing.T, tls bool, configure ...func(*fakeServer)) *fake
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if r.URL.Path == "/api/openapi.json" {
+		if strings.HasSuffix(r.URL.Path, "openapi.json") {
 			f.specGets = append(f.specGets, r.Header.Clone())
+			if f.specRedirect != "" && r.URL.Path == "/api/openapi.json" {
+				http.Redirect(w, r, f.specRedirect, http.StatusFound)
+				return
+			}
 			if f.specStatus != 0 {
 				w.WriteHeader(f.specStatus)
 				return
@@ -96,7 +105,7 @@ func newFakeServer(t *testing.T, tls bool, configure ...func(*fakeServer)) *fake
 		b, _ := io.ReadAll(r.Body)
 		f.calls = append(f.calls, recorded{Method: r.Method, Path: r.URL.EscapedPath(), RawQuery: r.URL.RawQuery,
 			Auth: r.Header.Get("Authorization"), ContentType: r.Header.Get("Content-Type"),
-			IdempotencyKey: r.Header.Get("Idempotency-Key"), Body: b})
+			IdempotencyKey: r.Header.Get("Idempotency-Key"), Cookie: r.Header.Get("Cookie"), Body: b})
 		if f.respond != nil {
 			f.respond(w, r)
 			return
@@ -136,9 +145,10 @@ type result struct {
 
 // env is one user's environment: a private cache directory and variables.
 type env struct {
-	cache string
-	vars  map[string]string
-	stdin string
+	cache  string
+	vars   map[string]string
+	stdin  string
+	stdout *os.File // when set, the CLI writes its standard output here
 }
 
 func newEnv(t *testing.T, server string) *env {
@@ -152,7 +162,9 @@ func (e *env) run(t *testing.T, args ...string) result {
 
 func (e *env) runBinary(t *testing.T, bin string, args ...string) result {
 	t.Helper()
-	cmd := exec.Command(bin, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "MAILGLO_") {
 			cmd.Env = append(cmd.Env, kv)
@@ -167,7 +179,13 @@ func (e *env) runBinary(t *testing.T, bin string, args ...string) result {
 	cmd.Stdin = strings.NewReader(e.stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if e.stdout != nil {
+		cmd.Stdout = e.stdout
+	}
 	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("mailglo %v did not finish in time", args)
+	}
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
 		code = ee.ExitCode()
@@ -266,10 +284,10 @@ func TestRequestMapping(t *testing.T) {
 	e.vars["MAILGLO_TOKEN"] = testToken
 
 	t.Run("path parameter is escaped", func(t *testing.T) {
-		r := e.run(t, "get-domain", "--domainId", "a b/c")
+		r := e.run(t, "get-domain", "--domainId", "a b?c#d")
 		want(t, r, 0)
 		c := srv.lastCall(t)
-		if c.Method != "GET" || c.Path != "/api/v1/domains/a%20b%2Fc" || c.Auth != "Bearer "+testToken {
+		if c.Method != "GET" || c.Path != "/api/v1/domains/a%20b%3Fc%23d" || c.Auth != "Bearer "+testToken {
 			t.Fatalf("call: %+v", c)
 		}
 		if decode[map[string]bool](t, r.Stdout)["ok"] != true {

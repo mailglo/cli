@@ -1,6 +1,7 @@
 {
   "openapi": "3.0.3",
   "info": {"title": "Fixture API", "version": "v1"},
+  "servers": [{"url": "/api/v1"}],
   "paths": {
     "/domains": {
       "get": {

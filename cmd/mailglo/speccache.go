@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,17 +40,32 @@ func parseServer(s string) (*url.URL, error) {
 	return u, nil
 }
 
-func cacheFile(server string) string {
-	dir, err := os.UserCacheDir()
+// cacheFile returns the cache file for server, or "" when there is no cache
+// directory this user alone controls.
+func cacheFile(server string, stderr io.Writer) string {
+	root, err := os.UserCacheDir()
 	if err != nil {
 		return ""
 	}
+	dir := filepath.Join(root, "mailglo")
+	if err := secureDir(dir); err != nil {
+		warn(stderr, "warning: not using the cache: "+err.Error())
+		return ""
+	}
 	sum := sha256.Sum256([]byte(server))
-	return filepath.Join(dir, "mailglo", "spec-"+hex.EncodeToString(sum[:8])+".json")
+	return filepath.Join(dir, "spec-"+hex.EncodeToString(sum[:8])+".json")
 }
 
-func readCache(path, server string) *cachedSpec {
+func readCache(path, server string, stderr io.Writer) *cachedSpec {
 	if path == "" {
+		return nil
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil
+	}
+	if err := trustedFile(fi); err != nil {
+		warn(stderr, fmt.Sprintf("warning: ignoring the cached API description %s: %v", path, err))
 		return nil
 	}
 	b, err := os.ReadFile(path)
@@ -64,12 +80,6 @@ func readCache(path, server string) *cachedSpec {
 }
 
 func writeCache(path string, c *cachedSpec) error {
-	if path == "" {
-		return fmt.Errorf("no user cache directory")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	b, err := json.Marshal(c)
 	if err != nil {
 		return err
@@ -93,30 +103,34 @@ func writeCache(path string, c *cachedSpec) error {
 // is none to use.
 func loadSpec(base *url.URL, stderr io.Writer) ([]byte, int) {
 	server := base.String()
-	path := cacheFile(server)
-	cached := readCache(path, server)
+	path := cacheFile(server, stderr)
+	cached := readCache(path, server, stderr)
 
 	fresh, err := fetchSpec(server, cached)
 	if err == nil && fresh == nil {
 		return cached.Spec, exitOK // 304 Not Modified
 	}
 	if err == nil {
-		if werr := writeCache(path, fresh); werr != nil {
-			_, _ = fmt.Fprintln(stderr, "mailglo: warning: cannot cache the API description:", werr)
+		if path != "" {
+			if werr := writeCache(path, fresh); werr != nil {
+				warn(stderr, "warning: cannot cache the API description: "+werr.Error())
+			}
 		}
 		return fresh.Spec, exitOK
 	}
 	if cached != nil {
-		_, _ = fmt.Fprintf(stderr, "mailglo: warning: cannot fetch the API description from %s (%v); using the copy cached %s\n",
-			server, err, cached.FetchedAt.Local().Format(time.RFC3339))
+		warn(stderr, fmt.Sprintf("warning: cannot fetch the API description from %s (%v); using the copy cached %s",
+			server, err, cached.FetchedAt.Local().Format(time.RFC3339)))
 		return cached.Spec, exitOK
 	}
-	_, _ = fmt.Fprintf(stderr, "mailglo: cannot fetch the API description from %s: %v; retry later\n", server, err)
+	warn(stderr, fmt.Sprintf("cannot fetch the API description from %s: %v; retry later", server, err))
 	return nil, exitRetry
 }
 
 // fetchSpec downloads the description. It returns nil, nil when the cached
-// copy is still current. It never sends the API token.
+// copy is still current. It never sends the API token, and it follows
+// redirects only within the server's origin, so a redirect cannot swap in a
+// description from elsewhere or downgrade https to http.
 func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 	req, err := http.NewRequest(http.MethodGet, server+"/api/openapi.json", nil)
 	if err != nil {
@@ -132,7 +146,8 @@ func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 			req.Header.Set("If-Modified-Since", cached.LastModified)
 		}
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: sameOriginRedirects}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +170,39 @@ func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 	}
 	return &cachedSpec{Server: server, ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified"),
 		FetchedAt: time.Now().UTC(), Spec: b}, nil
+}
+
+// sameOriginRedirects is an http.Client redirect policy that stays on the
+// first request's scheme, host and port.
+func sameOriginRedirects(r *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("too many redirects")
+	}
+	if !sameOrigin(r.URL, via[0].URL) {
+		return fmt.Errorf("refusing to follow a redirect to another origin (%s)", origin(r.URL))
+	}
+	return nil
+}
+
+// sameOrigin compares scheme, host and effective port.
+func sameOrigin(a, b *url.URL) bool { return origin(a) == origin(b) }
+
+func origin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host + ":" + port
 }
 
 func userAgent() string {

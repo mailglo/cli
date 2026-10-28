@@ -14,13 +14,11 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"sort"
 	"strings"
 )
 
@@ -38,6 +36,12 @@ const usage = `usage:
   mailglo [--server URL] help <operation>
   mailglo [--server URL] <operation> [--param value]... [--body JSON|@file|-]
   mailglo version
+
+flags:
+  --name value, --name=value   a parameter; repeat it for a list
+  --path.name, --query.name    a parameter by location, when names clash
+  --header.name, --cookie.name
+  --body, --request-body       the JSON request body: inline, @file, or - for stdin
 
 environment:
   MAILGLO_URL    server URL (default ` + defaultServer + `); --server overrides it
@@ -83,14 +87,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "version", "--version":
 		v, c, d := buildInfo()
-		return emit(stdout, map[string]string{"version": v, "commit": c, "date": d, "go": runtime.Version()})
+		return emit(stdout, stderr, map[string]string{"version": v, "commit": c, "date": d, "go": runtime.Version()})
 	case "-h", "--help":
-		_, _ = fmt.Fprintln(stdout, usage)
-		return exitOK
+		return write(stdout, stderr, []byte(usage+"\n"))
 	case "help":
 		if len(args) == 1 {
-			_, _ = fmt.Fprintln(stdout, usage)
-			return exitOK
+			return write(stdout, stderr, []byte(usage+"\n"))
 		}
 	}
 
@@ -106,45 +108,57 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if code != exitOK {
 		return code
 	}
-	ops, err := parseSpec(raw)
+	a, err := parseSpec(raw)
 	if err != nil {
 		return fail(stderr, exitError, "cannot read the API description: "+err.Error())
 	}
 
 	switch args[0] {
 	case "operations":
-		var list []map[string]string
-		seen := map[*operation]bool{}
-		for _, o := range ops {
-			if !seen[o] {
-				seen[o] = true
-				list = append(list, map[string]string{"operation": kebab(o.ID), "method": o.Method, "path": o.Path, "summary": o.Summary})
-			}
+		list := []map[string]string{}
+		for _, o := range a.Ops {
+			list = append(list, map[string]string{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path, "summary": o.Summary})
 		}
-		sort.Slice(list, func(i, j int) bool { return list[i]["operation"] < list[j]["operation"] })
-		return emit(stdout, list)
+		return emit(stdout, stderr, list)
 	case "help":
-		o := ops[strings.ToLower(args[1])]
-		if o == nil {
-			return fail(stderr, exitUsage, "unknown operation; run: mailglo operations")
+		o, err := a.lookup(args[1])
+		if err != nil {
+			return fail(stderr, exitUsage, err.Error())
 		}
-		params := []map[string]any{}
-		for _, p := range o.Params {
-			params = append(params, map[string]any{"flag": "--" + p.Name, "in": p.In, "required": p.Required, "description": p.Description})
-		}
-		info := map[string]any{"operation": kebab(o.ID), "method": o.Method, "path": o.Path, "summary": o.Summary, "parameters": params}
-		if o.Body != nil {
-			info["body_required"] = o.Body.Required
-			info["body_fields"] = o.Body.Fields
-		}
-		return emit(stdout, info)
+		return emit(stdout, stderr, helpInfo(o))
 	}
 
-	o := ops[strings.ToLower(args[0])]
-	if o == nil {
-		return fail(stderr, exitUsage, fmt.Sprintf("unknown operation %q; run: mailglo operations", args[0]))
+	o, err := a.lookup(args[0])
+	if err != nil {
+		return fail(stderr, exitUsage, err.Error())
 	}
-	return call(base, o, args[1:], token, stdin, stdout, stderr)
+	return call(base, a, o, args[1:], token, stdin, stdout, stderr)
+}
+
+func helpInfo(o *operation) map[string]any {
+	params := []map[string]any{}
+	for _, p := range o.Params {
+		m := map[string]any{"flag": paramFlag(o, p), "qualified_flag": "--" + p.In + "." + p.Name, "in": p.In,
+			"required": p.Required, "description": p.Description}
+		if p.Array {
+			m["repeatable"] = true
+		}
+		params = append(params, m)
+	}
+	info := map[string]any{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path,
+		"summary": o.Summary, "parameters": params}
+	if b := o.Body; b != nil {
+		info["body_flag"] = bodyFlag(o)
+		info["body_needed"] = b.Required
+		if b.MediaType != "" {
+			info["body_media_type"] = b.MediaType
+			info["body_fields"] = b.Fields
+			info["body_required"] = b.RequiredFields
+		} else {
+			info["body_media_types_unsupported"] = b.Declared
+		}
+	}
+	return info
 }
 
 // buildInfo reports the version stamped at release, or the module version
@@ -167,19 +181,6 @@ func buildInfo() (v, c, d string) {
 		}
 	}
 	return
-}
-
-func emit(w io.Writer, v any) int {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
-	return exitOK
-}
-
-func fail(w io.Writer, code int, msg string) int {
-	_, _ = fmt.Fprintln(w, "mailglo:", msg)
-	return code
 }
 
 // kebab turns an operationId such as ListDomains into list-domains.

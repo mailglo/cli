@@ -41,8 +41,9 @@ Create an API token in your Mailglo workspace and export it:
 export MAILGLO_TOKEN=...
 ```
 
-Treat the token like a password. `mailglo` sends it only over https, or over plain
-http to `localhost`, and never prints it.
+Treat the token like a password. `mailglo` sends it only to the server you chose,
+over https or over plain http to `localhost`. It does not follow a redirect to
+another server with the token, and it never prints the token.
 
 | Variable        | Purpose                                                         |
 | --------------- | --------------------------------------------------------------- |
@@ -61,8 +62,17 @@ mailglo version
 ```
 
 Each operation parameter becomes a flag with the same name (`--name value` or
-`--name=value`). Path, query and header parameters are all flags. `--body` takes a
-JSON request body inline, from a file (`@body.json`) or from standard input (`-`).
+`--name=value`), whether it goes in the path, the query, a header or a cookie.
+
+- When two parameters share a name, give the location: `--path.id 1 --query.id 2`.
+- Repeat the flag for a list parameter: `--tag a --tag b`.
+- `--body` takes the JSON request body inline, from a file (`@body.json`) or from
+  standard input (`-`). If the operation has a parameter called `body`, use
+  `--request-body` for the request body instead.
+
+`mailglo help <operation>` shows the flags, whether each one is required or
+repeatable, and the body's fields and media type. Operation names are the API's
+operation IDs in kebab case, such as `list-domains`.
 
 Examples (run `mailglo operations` for the full list):
 
@@ -81,15 +91,15 @@ the `--cursor` value for the next page.
 
 ## Exit codes
 
-| Code | Meaning                                                   |
-| ---- | --------------------------------------------------------- |
-| 0    | Success                                                   |
-| 1    | Other error, such as a rejected request (HTTP 400 or 422) |
-| 2    | Usage error: unknown operation, missing flag, bad body    |
-| 3    | Not signed in, or not allowed (HTTP 401 or 403)           |
-| 4    | Not found (HTTP 404 or 410)                               |
-| 5    | Conflict or stale state (HTTP 409 or 402)                 |
-| 6    | Rate limit, outage or network failure: retry later        |
+| Code | Meaning                                                                          |
+| ---- | -------------------------------------------------------------------------------- |
+| 0    | Success                                                                          |
+| 1    | Other error: a rejected request (HTTP 400 or 422), output that cannot be written |
+| 2    | Usage error: unknown operation, missing flag, bad body                           |
+| 3    | Not signed in, or not allowed (HTTP 401 or 403)                                  |
+| 4    | Not found (HTTP 404 or 410)                                                      |
+| 5    | Conflict or stale state (HTTP 409 or 402)                                        |
+| 6    | Rate limit, outage or network failure: retry later                               |
 
 ## API description cache
 
@@ -97,7 +107,9 @@ the `--cursor` value for the next page.
 (`~/.cache/mailglo` on Linux, `~/Library/Caches/mailglo` on macOS,
 `%LocalAppData%\mailglo` on Windows). Every run asks the server whether the copy is
 current. When the server cannot be reached, `mailglo` uses the cached copy and prints
-a warning. With no cached copy it exits with code 6. Delete the directory to reset
+a warning. With no cached copy it exits with code 6. On macOS and Linux it uses the
+directory only if it belongs to you and no one else can write to it. Delete the
+directory to reset
 it.
 
 ## Build and test
