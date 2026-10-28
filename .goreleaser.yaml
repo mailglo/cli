@@ -29,9 +29,13 @@ archives:
       - goos: windows
         formats: [zip]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    # The binaries include the Go runtime and standard library, whose BSD
-    # licence must accompany them.
-    files: [LICENSE, NOTICE, README.md, licenses/go/LICENSE]
+    # The binaries include the Go runtime, the standard library and the
+    # modules listed in NOTICE; their licences must accompany them.
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - licenses/**/*
 
 checksum:
   name_template: checksums.txt

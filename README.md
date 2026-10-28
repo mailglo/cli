@@ -93,33 +93,44 @@ the `--cursor` value for the next page.
 ## Supported API descriptions
 
 `mailglo` is built for the Mailglo API description, not for every OpenAPI document.
-It accepts this subset:
+It reads the description with [kin-openapi](https://github.com/getkin/kin-openapi),
+which loads it, resolves its references and validates it, and then accepts this
+subset:
 
-- **Document**: OpenAPI 3.0 or 3.1, served as JSON, with a `paths` object.
-- **References**: local `$ref`s only (`#/...`), read as JSON Pointers with
-  percent-decoding, `~0`, `~1` and array indices (`0` or `[1-9][0-9]*`). Beside
-  `$ref`, only `summary` and `description` are allowed.
+- **Document**: OpenAPI 3.0 or 3.1, served as JSON, at most 16 MiB, that passes
+  kin-openapi's validation. Only references inside the document (`#/...`) are
+  followed. A `$ref` with other keys beside it is refused.
 - **Paths**: absolute (`/...`), without `?`, `#`, spaces or backslashes. Every
   `{variable}` has a path parameter and every path parameter is in the path.
 - **Servers**: the first `servers` entry of the operation, else of the path, else of
   the document. Each `{variable}` is replaced once by its default, and the result
-  must be at most 2048 bytes. A relative URL resolves against
-  the URL the description came from. Only its path is used: requests always go to
-  the server you selected. With no `servers`, the base path is `/api/v1`.
-- **Parameters**: scalar or array schemas, each declared once per list, with no `=`
-  in the name.
+  must be at most 2048 bytes. A relative URL resolves against the URL the
+  description came from. Only its path is used: requests always go to the server
+  you selected. With no `servers`, the base path is `/api/v1`.
+- **Parameters**: a scalar schema, or an array of scalars. Each is declared once
+  per list; header names are compared case-insensitively. No `=` in the name.
   - path: `simple`, `label` or `matrix`
   - query: `form`; arrays also `spaceDelimited` or `pipeDelimited`
   - header: `simple`
   - cookie: `form`, single values only
 
-  Not supported: `content` instead of `schema`, object schemas, `allOf`, `oneOf`,
-  `anyOf` or `not` in a parameter schema, `deepObject`, `allowReserved`, other
-  locations, and header parameters the CLI or HTTP sets itself (`Accept`,
-  `Authorization`, `Content-Type`, `Cookie`, `Host`, `User-Agent` and other
-  connection headers).
-- **Request bodies**: `application/json`, any `*/*+json` type, or
+  Not supported: `content` instead of `schema`; object schemas or object items;
+  arrays of arrays; `allOf`, `oneOf`, `anyOf`, `not`, `if` or `prefixItems` in a
+  parameter schema; `deepObject`; `allowReserved`; and header parameters the CLI or
+  HTTP sets itself (`Accept`, `Authorization`, `Content-Type`, `Cookie`, `Host`,
+  `User-Agent` and other connection headers).
+- **Request bodies**: `application/json`, a valid `type/subtype+json` media type, or
   `application/octet-stream` (sent as raw bytes from `--body @file` or `-`).
+
+A document that does not load or validate, or is outside the subset as a whole, is
+refused with kin-openapi's or the CLI's message. An operation outside the subset
+still appears in `mailglo operations` and `mailglo help` with an `unsupported`
+field that names the construct, and running it exits with code 2.
+
+Command names are operationIds in kebab case, at most 200 bytes. An operation
+without an operationId is named after its method and path, such as `get-health`.
+When names clash, or an operation would be named `help`, `operations` or
+`version`, the method is appended (`version-get`), then a number.
 
 ### Threat model
 
@@ -127,20 +138,14 @@ The API description comes from the server you chose, over https or from your own
 machine, so `mailglo` trusts it to describe that server's API. It does not trust it
 with anything else: requests, the token and redirects stay on the selected server's
 origin, and text from the description is escaped before it reaches your terminal.
+Over plain http to this machine, the description and requests connect directly,
+never through a proxy.
 
 A description outside the subset, or a hostile one, may not work, but it cannot make
-`mailglo` misbehave. Work and memory are bounded: the description is at most 64 MiB,
-parsing has a fixed step budget, and server URLs are capped. Anything the CLI cannot
-handle is refused with a message that names it.
-
-A document outside the subset is refused. An operation outside it still appears in
-`mailglo operations` and `mailglo help` with an `unsupported` field that names the
-construct, and running it exits with code 2.
-
-Command names are operationIds in kebab case. An operation without an operationId
-is named after its method and path, such as `get-health`. When names clash, or an
-operation would be named `help`, `operations` or `version`, the method is appended
-(`version-get`), then a number.
+`mailglo` misbehave. Work and memory are bounded: the description is at most 16 MiB,
+loading and validating it must finish within 20 seconds, the CLI's own processing
+has a fixed step budget, and names and server URLs are capped. Anything the CLI
+cannot handle is refused with a message that names it.
 
 ## Exit codes
 

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -171,22 +173,56 @@ func TestHostileSchemasAreCheap(t *testing.T) {
 		t.Fatalf("help: %s", r.Stdout)
 	}
 
-	// 3000 operations, each with a 400-schema chain: over the budget.
+	// 3000 operations sharing a 400-schema chain: each schema is read once.
 	chain := map[string]any{}
 	for i := 0; i < 400; i++ {
 		chain[fmt.Sprintf("C%d", i)] = map[string]any{"allOf": []any{map[string]any{"$ref": fmt.Sprintf("#/components/schemas/C%d", i+1)}}}
 	}
+	chain["C400"] = map[string]any{"properties": map[string]any{"end": map[string]any{}}}
 	paths := map[string]any{}
-	for i := 0; i < 3000; i++ {
+	for i := 0; i < size(3000); i++ {
 		paths[fmt.Sprintf("/p%d", i)] = map[string]any{"post": map[string]any{"operationId": fmt.Sprintf("Op%d", i),
 			"requestBody": map[string]any{"content": map[string]any{"application/json": map[string]any{
 				"schema": map[string]any{"$ref": "#/components/schemas/C0"}}}}}}
 	}
 	b, _ = json.Marshal(map[string]any{"openapi": "3.0.3", "components": map[string]any{"schemas": chain}, "paths": paths})
-	r = newEnv(t, specServer(t, string(b)).URL).run(t, "operations")
-	want(t, r, 6)
-	if !strings.Contains(r.Stderr, "too complex") {
-		t.Fatalf("stderr: %s", r.Stderr)
+	r = newEnv(t, specServer(t, string(b)).URL).run(t, "help", fmt.Sprintf("op%d", size(3000)-1))
+	want(t, r, 0)
+	if !strings.Contains(r.Stdout, `"end"`) {
+		t.Fatalf("help: %s", r.Stdout)
+	}
+
+	// 50 operations sharing a body schema with 10,000 properties: the
+	// field list is built once and shared.
+	props := map[string]any{}
+	for i := 0; i < size(10000); i++ {
+		props[fmt.Sprintf("f%d", i)] = map[string]any{"type": "string"}
+	}
+	paths = map[string]any{}
+	for i := 0; i < 50; i++ {
+		paths[fmt.Sprintf("/q%d", i)] = map[string]any{"post": map[string]any{"operationId": fmt.Sprintf("Q%d", i),
+			"requestBody": map[string]any{"content": map[string]any{"application/json": map[string]any{
+				"schema": map[string]any{"$ref": "#/components/schemas/Wide"}}}}}}
+	}
+	b, _ = json.Marshal(map[string]any{"openapi": "3.0.3", "components": map[string]any{"schemas": map[string]any{"Wide": map[string]any{"properties": props}}}, "paths": paths})
+	start := time.Now()
+	a, err := parseSpec(completeSpec(b))
+	if err != nil || len(a.Ops) != 50 || len(a.byName["q49"].Body.Fields) != size(10000) {
+		t.Fatalf("parse: %v", err)
+	}
+	if &a.byName["q0"].Body.Fields[0] != &a.byName["q49"].Body.Fields[0] {
+		t.Fatal("each operation built its own field list")
+	}
+	if !raceEnabled && time.Since(start) > 10*time.Second {
+		t.Fatalf("parsing took %s", time.Since(start))
+	}
+
+	// Loading and validating run under a deadline: a description that
+	// takes too long is refused instead of holding the CLI.
+	start = time.Now()
+	_, err = parseSpecWithin(completeSpec(b), 50*time.Millisecond)
+	if !errors.Is(err, errTooComplex) || time.Since(start) > 2*time.Second {
+		t.Fatalf("deadline: %v after %s", err, time.Since(start))
 	}
 }
 
@@ -483,10 +519,10 @@ func TestQualifiedFlags(t *testing.T) {
 func TestArrayParameters(t *testing.T) {
 	spec := `{"openapi":"3.0.3","paths":{"/search":{"get":{"operationId":"Search","parameters":[
 		{"name":"tag","in":"query","schema":{"type":"array","items":{"type":"string"}}},
-		{"name":"ids","in":"query","explode":false,"schema":{"type":"array"}},
-		{"name":"pipes","in":"query","style":"pipeDelimited","explode":false,"schema":{"type":"array"}},
+		{"name":"ids","in":"query","explode":false,"schema":{"type":"array","items":{"type":"string"}}},
+		{"name":"pipes","in":"query","style":"pipeDelimited","explode":false,"schema":{"type":"array","items":{"type":"string"}}},
 		{"name":"single","in":"query","schema":{"type":"string"}},
-		{"name":"X-Ids","in":"header","schema":{"type":"array"}}]}}}}`
+		{"name":"X-Ids","in":"header","schema":{"type":"array","items":{"type":"string"}}}]}}}}`
 	srv := specServer(t, spec)
 	e := newEnv(t, srv.URL)
 	want(t, e.run(t, "search", "--tag", "a", "--tag", "b c", "--ids", "1", "--ids=2,3", "--pipes", "x", "--pipes", "y",
@@ -561,8 +597,8 @@ func TestJSONMediaTypes(t *testing.T) {
 	}
 }
 
-// Item 14: release archives carry the Go licence; the copy must match the
-// toolchain's.
+// Item 14: release archives carry the Go licence and every linked
+// module's; the copies must match the originals.
 func TestGoLicenceIsBundled(t *testing.T) {
 	out, err := exec.Command("go", "env", "GOROOT").Output()
 	if err != nil {
@@ -577,12 +613,43 @@ func TestGoLicenceIsBundled(t *testing.T) {
 		t.Fatalf("licenses/go/LICENSE differs from the Go toolchain's LICENSE (%v)", err)
 	}
 	cfg, err := os.ReadFile(filepath.Join("..", "..", ".goreleaser.yaml"))
-	if err != nil || !bytes.Contains(cfg, []byte("licenses/go/LICENSE")) {
-		t.Fatal(".goreleaser.yaml does not put licenses/go/LICENSE in the archives")
+	if err != nil || !bytes.Contains(cfg, []byte("licenses/**/*")) {
+		t.Fatal(".goreleaser.yaml does not put licenses/ in the archives")
 	}
 	notice, err := os.ReadFile(filepath.Join("..", "..", "NOTICE"))
 	if err != nil || !bytes.Contains(notice, []byte("licenses/go/LICENSE")) {
 		t.Fatal("NOTICE does not mention the Go licence")
+	}
+
+	// Every module linked into the binary has its licence, the same text
+	// as in the module, and a line in NOTICE.
+	list, err := exec.Command("go", "list", "-deps", "-f", "{{with .Module}}{{.Path}} {{.Dir}}{{end}}", ".").Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(list)), "\n") {
+		path, dir, _ := strings.Cut(line, " ")
+		if path == "" || path == "github.com/mailglo/cli" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		for _, name := range []string{"LICENSE", "NOTICE"} {
+			want, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				continue // the module has no such file
+			}
+			got, err := os.ReadFile(filepath.Join("..", "..", "licenses", filepath.FromSlash(path), name))
+			if err != nil || !bytes.Equal(got, want) {
+				t.Errorf("licenses/%s/%s is missing or differs from the module's", path, name)
+			}
+		}
+		if !bytes.Contains(notice, []byte(path+",")) {
+			t.Errorf("NOTICE does not list %s", path)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no dependencies listed")
 	}
 }
 

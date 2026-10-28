@@ -128,13 +128,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if token != "" && args[0] != "operations" && args[0] != "help" && !safeForToken(base) {
 		return fail(stderr, exitUsage, fmt.Sprintf("refusing to send MAILGLO_TOKEN to %s: use an https URL (plain http is allowed only for localhost)", base.Redacted()))
 	}
-	raw, docURL, code := loadSpec(base, stderr)
+	a, docURL, code := loadSpec(base, stderr)
 	if code != exitOK {
 		return code
-	}
-	a, err := parseSpec(raw)
-	if err != nil {
-		return fail(stderr, exitError, "cannot read the API description: "+err.Error())
 	}
 
 	switch args[0] {

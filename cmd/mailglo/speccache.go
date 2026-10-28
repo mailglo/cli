@@ -23,8 +23,6 @@ import (
 // new server release shows up without a CLI upgrade. When the server cannot
 // be reached, the cached copy is used with a warning.
 
-const maxSpecBytes = 64 << 20
-
 // A cache file is one line of JSON metadata, a newline, then the
 // description exactly as the server sent it. Every description the CLI
 // accepts therefore fits within the read limit.
@@ -42,6 +40,7 @@ type cachedSpec struct {
 	LastModified string    `json:"last_modified,omitempty"`
 	FetchedAt    time.Time `json:"fetched_at"`
 	Spec         []byte    `json:"-"`
+	parsed       *api      // set once Spec has been parsed
 }
 
 // parseServer checks a server URL and returns it without a trailing slash.
@@ -159,9 +158,6 @@ func (c *specCache) read(server string, stderr io.Writer) *cachedSpec {
 		return nil
 	}
 	cs.Spec = spec
-	if validSpec(cs.Spec) != nil {
-		return nil
-	}
 	if u, err := url.Parse(cs.URL); err != nil || !sameOrigin(u, mustParse(server)) {
 		return nil
 	}
@@ -196,30 +192,41 @@ func (c *specCache) write(cs *cachedSpec) error {
 	return c.root.Rename(tmp, c.name)
 }
 
-// loadSpec returns the server's API description and the URL it came from,
-// or an exit code when there is none to use.
-func loadSpec(base *url.URL, stderr io.Writer) ([]byte, string, int) {
+// loadSpec returns the server's parsed API description and the URL it came
+// from, or an exit code when there is none to use. The description is
+// parsed once per run.
+func loadSpec(base *url.URL, stderr io.Writer) (*api, string, int) {
 	server := base.String()
 	cache := openCache(server, stderr)
 	defer cache.close()
 	cached := cache.read(server, stderr)
 
-	fresh, err := fetchSpec(server, cached)
-	if err == nil {
-		if fresh != cached && cache != nil {
-			if werr := cache.write(fresh); werr != nil {
-				warn(stderr, "warning: cannot cache the API description: "+werr.Error())
-			}
+	use, err := fetchSpec(server, cached)
+	if err == nil && use.parsed != nil && cache != nil { // a new description
+		if werr := cache.write(use); werr != nil {
+			warn(stderr, "warning: cannot cache the API description: "+werr.Error())
 		}
-		return fresh.Spec, fresh.URL, exitOK
+	} else if err == nil && use != cached && cache != nil { // the same one, moved
+		_ = cache.write(use)
 	}
-	if cached != nil {
+	if err != nil {
+		if cached == nil {
+			warn(stderr, fmt.Sprintf("cannot fetch the API description from %s: %v; retry later", server, err))
+			return nil, "", exitRetry
+		}
 		warn(stderr, fmt.Sprintf("warning: cannot fetch the API description from %s (%v); using the copy cached %s",
 			server, err, cached.FetchedAt.Local().Format(time.RFC3339)))
-		return cached.Spec, cached.URL, exitOK
+		use = cached
 	}
-	warn(stderr, fmt.Sprintf("cannot fetch the API description from %s: %v; retry later", server, err))
-	return nil, "", exitRetry
+	if use.parsed == nil {
+		a, perr := parseSpec(use.Spec)
+		if perr != nil {
+			warn(stderr, "the cached API description is not usable ("+perr.Error()+"); retry later")
+			return nil, "", exitRetry
+		}
+		use.parsed = a
+	}
+	return use.parsed, use.URL, exitOK
 }
 
 // fetchSpec downloads the description, or returns cached when the server
@@ -241,7 +248,9 @@ func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 			req.Header.Set("If-Modified-Since", cached.LastModified)
 		}
 	}
-	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: sameOriginRedirects}
+	// The description decides what later requests do, so it travels like
+	// them: on the server's origin, and directly when that is this machine.
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: sameOriginRedirects, Transport: transport(mustParse(server))}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -266,11 +275,12 @@ func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 	if len(b) > maxSpecBytes {
 		return nil, fmt.Errorf("description larger than %d bytes", maxSpecBytes)
 	}
-	if err := validSpec(b); err != nil {
-		return nil, err
+	a, err := parseSpec(b)
+	if err != nil {
+		return nil, fmt.Errorf("not a usable OpenAPI description: %w", err)
 	}
 	return &cachedSpec{Server: server, URL: final, ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified"),
-		FetchedAt: time.Now().UTC(), Spec: b}, nil
+		FetchedAt: time.Now().UTC(), Spec: b, parsed: a}, nil
 }
 
 // sameOriginRedirects is an http.Client redirect policy that stays on the

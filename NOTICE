@@ -1,6 +1,15 @@
 Mailglo CLI
 Copyright 2026 Mailglo
 
-The mailglo binaries include the Go runtime and standard library,
-Copyright 2009 The Go Authors, under the BSD 3-Clause licence in
-licenses/go/LICENSE. The CLI has no other third-party dependencies.
+The mailglo binaries include the following third-party software. Each
+licence, and any NOTICE file the project ships, is in licenses/<module>/.
+
+- Go runtime and standard library, Copyright 2009 The Go Authors,
+  BSD 3-Clause licence: licenses/go/LICENSE
+- github.com/getkin/kin-openapi, MIT licence
+- github.com/go-openapi/jsonpointer, Apache License 2.0 (with NOTICE)
+- github.com/go-openapi/swag/jsonname, Apache License 2.0
+- github.com/oasdiff/yaml, MIT licence
+- github.com/oasdiff/yaml3, MIT and Apache License 2.0 (with NOTICE)
+- github.com/santhosh-tekuri/jsonschema/v6, Apache License 2.0
+- golang.org/x/text, BSD 3-Clause licence

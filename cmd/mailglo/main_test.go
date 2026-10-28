@@ -99,7 +99,7 @@ func newFakeServer(t *testing.T, tls bool, configure ...func(*fakeServer)) *fake
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(f.spec)
+			_, _ = w.Write(completeSpec(f.spec))
 			return
 		}
 		b, _ := io.ReadAll(r.Body)
@@ -120,6 +120,59 @@ func newFakeServer(t *testing.T, tls bool, configure ...func(*fakeServer)) *fake
 	}
 	t.Cleanup(f.Close)
 	return f
+}
+
+// completeSpec fills in what OpenAPI requires but the tests' short
+// descriptions leave out: info, a response for each operation and a schema
+// for each parameter. Anything
+// that is not a JSON object with paths is served as it is.
+func completeSpec(raw []byte) []byte {
+	var doc map[string]any
+	if json.Unmarshal(raw, &doc) != nil {
+		return raw
+	}
+	paths, ok := doc["paths"].(map[string]any)
+	if !ok {
+		return raw
+	}
+	if _, ok := doc["info"]; !ok {
+		doc["info"] = map[string]any{"title": "Test API", "version": "1"}
+	}
+	// A parameter without schema or content gets a string schema.
+	fill := func(list any) {
+		params, _ := list.([]any)
+		for _, p := range params {
+			if p, ok := p.(map[string]any); ok && p["$ref"] == nil && p["schema"] == nil && p["content"] == nil {
+				p["schema"] = map[string]any{"type": "string"}
+			}
+		}
+	}
+	if comps, ok := doc["components"].(map[string]any); ok {
+		if ps, ok := comps["parameters"].(map[string]any); ok {
+			for _, p := range ps {
+				fill([]any{p})
+			}
+		}
+	}
+	for _, item := range paths {
+		item, _ := item.(map[string]any)
+		fill(item["parameters"])
+		for _, m := range []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"} {
+			if op, ok := item[m].(map[string]any); ok {
+				fill(op["parameters"])
+				if _, ok := op["responses"]; !ok {
+					op["responses"] = map[string]any{"200": map[string]any{"description": "OK"}}
+				}
+			}
+		}
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(doc) != nil {
+		return raw
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 }
 
 func (f *fakeServer) lastCall(t *testing.T) recorded {
@@ -464,8 +517,13 @@ func TestDescriptionCache(t *testing.T) {
 		// A new server release adds an operation; the CLI picks it up.
 		srv.set(func() {
 			srv.etag = `"v2"`
-			srv.spec = bytes.Replace(srv.spec, []byte(`"get": {"operationId": "GetDomain"`),
-				[]byte(`"put": {"operationId": "RenameDomain", "summary": "Rename."}, "get": {"operationId": "GetDomain"`), 1)
+			var doc map[string]any
+			if err := json.Unmarshal(srv.spec, &doc); err != nil {
+				t.Fatal(err)
+			}
+			item := doc["paths"].(map[string]any)["/domains/{domainId}"].(map[string]any)
+			item["put"] = map[string]any{"operationId": "RenameDomain", "summary": "Rename."}
+			srv.spec, _ = json.Marshal(doc)
 		})
 		r = e.run(t, "operations")
 		want(t, r, 0)

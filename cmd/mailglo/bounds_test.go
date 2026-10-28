@@ -48,17 +48,22 @@ func TestPlainHTTPTokenStaysLocal(t *testing.T) {
 		t.Fatalf("proxy saw %v", got)
 	}
 
+	// Neither the description nor the API request to this machine goes
+	// through the proxy, so the proxy can neither read the token nor
+	// change the description.
 	for _, server := range []string{"http://localhost" + port, "http://LOCALHOST" + port, srv.URL} {
-		e := withProxy(newEnv(t, server))
-		e.vars["MAILGLO_TOKEN"] = testToken
-		before := len(seen())
-		want(t, e.run(t, "get-domain", "--domainId", "d"), 0)
-		if c := srv.lastCall(t); c.Auth != "Bearer "+testToken {
-			t.Fatalf("%s: auth %q", server, c.Auth)
-		}
-		for _, s := range seen()[before:] {
-			if strings.Contains(s, "auth=Bearer") {
-				t.Fatalf("%s: the token went through the proxy: %s", server, s)
+		for _, token := range []string{"", testToken} {
+			e := withProxy(newEnv(t, server))
+			if token != "" {
+				e.vars["MAILGLO_TOKEN"] = token
+			}
+			before := len(seen())
+			want(t, e.run(t, "get-domain", "--domainId", "d"), 0)
+			if c := srv.lastCall(t); token != "" && c.Auth != "Bearer "+token {
+				t.Fatalf("%s: auth %q", server, c.Auth)
+			}
+			if got := seen()[before:]; len(got) != 0 {
+				t.Fatalf("%s: went through the proxy: %v", server, got)
 			}
 		}
 	}
@@ -93,11 +98,13 @@ func TestServerVariablesAreBounded(t *testing.T) {
 	}
 
 	// 100,000 uses of a 100 KB default would expand to 10 GB; the limit
-	// stops the expansion as soon as it is passed.
+	// stops the expansion as soon as it is passed. (At the document level
+	// the validator already refuses a variable used twice, so this uses an
+	// operation's servers.)
 	spec, _ = json.Marshal(map[string]any{"openapi": "3.0.3",
-		"servers": []any{map[string]any{"url": "/" + strings.Repeat("{v}", 100000),
-			"variables": map[string]any{"v": map[string]any{"default": strings.Repeat("a", 100000)}}}},
-		"paths": map[string]any{"/x": map[string]any{"get": map[string]any{"operationId": "X"}}}})
+		"paths": map[string]any{"/x": map[string]any{"get": map[string]any{"operationId": "X",
+			"servers": []any{map[string]any{"url": "/" + strings.Repeat("{v}", 100000),
+				"variables": map[string]any{"v": map[string]any{"default": strings.Repeat("a", 100000)}}}}}}}})
 	r = newEnv(t, specServer(t, string(spec)).URL).run(t, "x")
 	want(t, r, 2)
 	if !strings.Contains(r.Stderr, "longer than 2048 bytes") {
@@ -116,7 +123,8 @@ func TestServerVariablesAreBounded(t *testing.T) {
 // Item 3: help for a very wide operation is linear.
 func TestWideHelpIsFast(t *testing.T) {
 	var params []any
-	for i := 0; i < 40000; i++ {
+	n := size(40000)
+	for i := 0; i < n; i++ {
 		params = append(params, map[string]any{"name": fmt.Sprintf("p%d", i), "in": "query"})
 	}
 	params = append(params, map[string]any{"name": "p1", "in": "header"}) // one ambiguous name
@@ -134,11 +142,12 @@ func TestWideHelpIsFast(t *testing.T) {
 	}
 	info := decode[map[string]any](t, r.Stdout)
 	ps := info["parameters"].([]any)
-	if len(ps) != 40001 || ps[1].(map[string]any)["flag"] != "--query.p1" || ps[2].(map[string]any)["flag"] != "--p2" {
+	if len(ps) != n+1 || ps[1].(map[string]any)["flag"] != "--query.p1" || ps[2].(map[string]any)["flag"] != "--p2" {
 		t.Fatalf("flags: %v %v", ps[1], ps[2])
 	}
-	want(t, e.run(t, "wide", "--p39999", "z", "--header.p1", "h"), 0)
-	if c := srv.lastCall(t); c.RawQuery != "p39999=z" {
+	last := fmt.Sprintf("p%d", n-1)
+	want(t, e.run(t, "wide", "--"+last, "z", "--header.p1", "h"), 0)
+	if c := srv.lastCall(t); c.RawQuery != last+"=z" {
 		t.Fatalf("query %s", c.RawQuery)
 	}
 }
@@ -146,7 +155,7 @@ func TestWideHelpIsFast(t *testing.T) {
 // Item 8: the cache stores the description as sent, so anything the CLI
 // accepts can be read back for offline use.
 func TestCacheStoresDescriptionVerbatim(t *testing.T) {
-	summary := strings.Repeat("<&>", 400000) // escaped as <... this would grow sixfold
+	summary := strings.Repeat("<&>", 400000) // escaped as \u003c and so on, this would grow sixfold
 	spec := `{"openapi":"3.0.3","paths":{"/x":{"get":{"operationId":"X","summary":"` + summary + `"}}}}`
 	srv := specServer(t, spec)
 	e := newEnv(t, srv.URL)

@@ -54,10 +54,11 @@ jobs:
           args: release --snapshot --clean
       - name: Check the archives carry the licences
         run: |
+          want=$(cd licenses && find . -type f | sed 's#^\./#licenses/#' | sort)
           for a in dist/*.tar.gz; do
-            tar -tzf "$a" | grep -qx licenses/go/LICENSE || { echo "$a lacks licenses/go/LICENSE"; exit 1; }
             tar -tzf "$a" | grep -qx NOTICE || { echo "$a lacks NOTICE"; exit 1; }
+            for f in $want; do tar -tzf "$a" | grep -qx "$f" || { echo "$a lacks $f"; exit 1; }; done
           done
           for a in dist/*.zip; do
-            unzip -l "$a" | grep -q ' licenses/go/LICENSE$' || { echo "$a lacks licenses/go/LICENSE"; exit 1; }
+            for f in $want; do unzip -l "$a" | grep -q " $f\$" || { echo "$a lacks $f"; exit 1; }; done
           done

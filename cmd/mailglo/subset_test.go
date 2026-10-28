@@ -18,10 +18,10 @@ import (
 func TestSupportedSubset(t *testing.T) {
 	t.Run("documents outside the subset are refused", func(t *testing.T) {
 		for spec, msg := range map[string]string{
-			`{"swagger":"2.0","paths":{}}`: `OpenAPI version "" is not supported`,
-			`{"openapi":"2.0","paths":{}}`: `OpenAPI version "2.0" is not supported`,
-			`{"openapi":"3.0.3"}`:          "no paths object",
-			`{"openapi":"3.0.3","paths":{"/x":{"$ref":"#/components/nothing"}}}`: `reference "#/components/nothing" does not resolve`,
+			`{"swagger":"2.0","paths":{}}`:                                       `OpenAPI version "" is not supported`,
+			`{"openapi":"2.0","paths":{}}`:                                       `OpenAPI version "2.0" is not supported`,
+			`{"openapi":"3.0.3","info":{"title":"t","version":"1"}}`:             "paths",
+			`{"openapi":"3.0.3","paths":{"/x":{"$ref":"#/components/nothing"}}}`: "#/components/nothing",
 		} {
 			r := newEnv(t, specServer(t, spec).URL).run(t, "operations")
 			want(t, r, 6)
@@ -31,83 +31,101 @@ func TestSupportedSubset(t *testing.T) {
 		}
 	})
 
-	t.Run("operations outside the subset are listed and refused", func(t *testing.T) {
-		ops := map[string]struct{ op, why string }{
-			"/a":       {`{"operationId":"A","parameters":[{"name":"q","in":"query","content":{"application/json":{}}}]}`, `parameter "q" uses content instead of schema`},
-			"/b":       {`{"operationId":"B","parameters":[{"name":"q","in":"query","allowReserved":true}]}`, `parameter "q" uses allowReserved`},
-			"/c":       {`{"operationId":"C","parameters":[{"name":"q","in":"query","schema":{"type":"object"}}]}`, `parameter "q" is an object`},
-			"/d":       {`{"operationId":"D","parameters":[{"name":"q","in":"query","style":"deepObject"}]}`, `uses style "deepObject"`},
-			"/e":       {`{"operationId":"E","parameters":[{"name":"h","in":"header","style":"form"}]}`, `header parameter "h" uses style "form"`},
-			"/f":       {`{"operationId":"F","parameters":[{"name":"c","in":"cookie","schema":{"type":"array"}}]}`, `cookie parameter "c" is an array`},
-			"/g/{id}":  {`{"operationId":"G"}`, "path variable {id} has no path parameter"},
-			"/h":       {`{"operationId":"H","parameters":[{"name":"id","in":"path","required":true}]}`, `path parameter "id" is not in the path`},
-			"i":        {`{"operationId":"I"}`, `path "i" is not a plain absolute path`},
-			"/j?x=1":   {`{"operationId":"J"}`, "is not a plain absolute path"},
-			"/k":       {`{"operationId":"K","servers":[{"url":"/{v}"}]}`, "has a variable without a default"},
-			"/l":       {`{"operationId":"L","parameters":[{"name":"q","in":"body"}]}`, `parameter "q" is in "body"`},
-			"/m":       {`{"operationId":"M","requestBody":{"content":{"multipart/form-data":{}}}}`, "request body media types [multipart/form-data] are not supported"},
-			"/n":       {`{"operationId":"N","parameters":[{"$ref":"other.json#/p"}]}`, `reference "other.json#/p" is not local`},
-			"/o":       {`{"operationId":"O","parameters":[{"name":"q","in":"query"},{"name":"q","in":"query"}]}`, `parameter "q" in query is declared twice`},
-			"/p":       {`{"operationId":"P","parameters":[{"name":"q","in":"query","style":"pipeDelimited"}]}`, "is not an array"},
-			"/ok/{id}": {`{"operationId":"Ok","parameters":[{"name":"id","in":"path","required":true}]}`, ""},
-			"/q":       {`{"operationId":"Q","parameters":[{"$ref":"#/components/parameters/Missing"}]}`, `reference "#/components/parameters/Missing" does not resolve`},
-			"/r":       {`{"operationId":"R","requestBody":{"$ref":"#/components/requestBodies/Gone"}}`, "does not resolve"},
-			"/s":       {`{"operationId":"S","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/A"}}]}`, "too long or circular"},
-			"/t":       {`{"operationId":"T","parameters":[{"name":"bad name","in":"header"}]}`, `header parameter "bad name" has an invalid name`},
-			"/u":       {`{"operationId":"U","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/A~2"}}]}`, "invalid ~ escape"},
-			// Round 3.
-			"/v1":      {`{"operationId":"V1","parameters":[{"name":"q","in":"query","schema":{"allOf":[{"type":"string"}]}}]}`, `parameter "q" has a schema using allOf`},
-			"/v2":      {`{"operationId":"V2","parameters":[{"name":"q","in":"query","schema":{"oneOf":[{"type":"string"},{"type":"object"}]}}]}`, "using oneOf"},
-			"/v3":      {`{"operationId":"V3","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/Any"}}]}`, "using anyOf"},
-			"/w1":      {`{"operationId":"W1","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/Str","type":"array"}}]}`, `has sibling "type"`},
-			"/w2":      {`{"operationId":"W2","requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Str","required":["x"]}}}}}`, `has sibling "required"`},
-			"/w3":      {`{"operationId":"W3","parameters":[{"$ref":"#/components/parameters/P","description":"Overrides the text."}]}`, ""},
-			"/x1/{id}": {`{"operationId":"X1"}`, `parameter "id" in path is declared twice`},
-			"/y1":      {`{"operationId":"Y1","parameters":[{"name":"Host","in":"header"}]}`, `header parameter "Host" is reserved`},
-			"/y2":      {`{"operationId":"Y2","parameters":[{"name":"user-agent","in":"header"}]}`, `header parameter "user-agent" is reserved`},
-			"/y3":      {`{"operationId":"Y3","parameters":[{"name":"Cookie","in":"header"}]}`, "is reserved"},
-			"/y4":      {`{"operationId":"Y4","parameters":[{"name":"X-Trace","in":"header"}]}`, ""},
-			"/z1":      {`{"operationId":"Z1","parameters":[{"name":"a=b","in":"query"}]}`, `parameter "a=b" has '=' in its name`},
-			"/z2":      {`{"operationId":"Z2","parameters":[{"$ref":"#/paths/~1u/get/parameters/-0"}]}`, `invalid array index "-0"`},
-			"/z3":      {`{"operationId":"Z3","servers":[{"url":"{a}","variables":{"a":{"default":"{a}{a}"}}}]}`, `server variable "a" has braces in its default`},
-		}
-		var paths []string
-		for p, o := range ops {
-			level := ""
-			if p == "/x1/{id}" { // duplicate path-level parameters
-				level = `"parameters":[{"name":"id","in":"path"},{"name":"id","in":"path","required":true}],`
+	// Each case is a path item next to a supported operation. "op" cases
+	// mark only that operation unsupported; "doc" cases fail validation, so
+	// the whole description is refused. Either way the message names the
+	// construct.
+	cases := []struct {
+		path, item, level, why string
+	}{
+		{"/a", `{"get":{"operationId":"A","parameters":[{"name":"q","in":"query","content":{"application/json":{}}}]}}`, "op", `parameter "q" uses content instead of schema`},
+		{"/b", `{"get":{"operationId":"B","parameters":[{"name":"q","in":"query","allowReserved":true}]}}`, "op", `parameter "q" uses allowReserved`},
+		{"/c", `{"get":{"operationId":"C","parameters":[{"name":"q","in":"query","schema":{"type":"object"}}]}}`, "op", `parameter "q" is an object`},
+		{"/d", `{"get":{"operationId":"D","parameters":[{"name":"q","in":"query","style":"deepObject","schema":{"type":"string"}}]}}`, "op", `uses style "deepObject"`},
+		{"/e", `{"get":{"operationId":"E","parameters":[{"name":"h","in":"header","style":"form"}]}}`, "doc", `serialization method with style="form"`},
+		{"/f", `{"get":{"operationId":"F","parameters":[{"name":"c","in":"cookie","schema":{"type":"array","items":{"type":"string"}}}]}}`, "op", `cookie parameter "c" is an array`},
+		{"/g/{id}", `{"get":{"operationId":"G"}}`, "doc", "must define exactly all path parameters"},
+		{"/h", `{"get":{"operationId":"H","parameters":[{"name":"id","in":"path","required":true}]}}`, "doc", "must define exactly all path parameters"},
+		{"i", `{"get":{"operationId":"I"}}`, "doc", "does not start with a forward slash"},
+		{"/j?x=1", `{"get":{"operationId":"J"}}`, "op", "is not a plain absolute path"},
+		{"/k", `{"get":{"operationId":"K","servers":[{"url":"/{v}"}]}}`, "op", "has a variable without a default"},
+		{"/l", `{"get":{"operationId":"L","parameters":[{"name":"q","in":"body"}]}}`, "doc", `'in' value "body"`},
+		{"/m", `{"get":{"operationId":"M","requestBody":{"content":{"multipart/form-data":{}}}}}`, "op", "request body media types [multipart/form-data] are not supported"},
+		{"/n", `{"get":{"operationId":"N","parameters":[{"$ref":"other.json#/p"}]}}`, "doc", "other.json"},
+		{"/o", `{"get":{"operationId":"O","parameters":[{"name":"q","in":"query"},{"name":"q","in":"query"}]}}`, "doc", `more than one "query" parameter has name "q"`},
+		{"/p", `{"get":{"operationId":"P","parameters":[{"name":"q","in":"query","style":"pipeDelimited","schema":{"type":"string"}}]}}`, "op", "is not an array"},
+		{"/q", `{"get":{"operationId":"Q","parameters":[{"$ref":"#/components/parameters/Missing"}]}}`, "doc", "Missing"},
+		{"/r", `{"get":{"operationId":"R","requestBody":{"$ref":"#/components/requestBodies/Gone"}}}`, "doc", "Gone"},
+		{"/t", `{"get":{"operationId":"T","parameters":[{"name":"bad name","in":"header"}]}}`, "op", `header parameter "bad name" has an invalid name`},
+		{"/u", `{"get":{"operationId":"U","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/A~2"}}]}}`, "doc", "A~2"},
+		{"/v1", `{"get":{"operationId":"V1","parameters":[{"name":"q","in":"query","schema":{"allOf":[{"type":"string"}]}}]}}`, "op", `parameter "q" has a schema using allOf`},
+		{"/v2", `{"get":{"operationId":"V2","parameters":[{"name":"q","in":"query","schema":{"oneOf":[{"type":"string"},{"type":"integer"}]}}]}}`, "op", "using oneOf"},
+		{"/v3", `{"get":{"operationId":"V3","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/Any"}}]}}`, "op", "using anyOf"},
+		{"/v4", `{"get":{"operationId":"V4","parameters":[{"name":"q","in":"query","schema":{"type":"array","items":{"type":"object"}}}]}}`, "op", `parameter "q items" is an object`},
+		{"/v5", `{"get":{"operationId":"V5","parameters":[{"name":"q","in":"query","schema":{"type":"array","items":{"$ref":"#/components/schemas/Obj"}}}]}}`, "op", `parameter "q items" is an object`},
+		{"/v6", `{"get":{"operationId":"V6","parameters":[{"name":"q","in":"query","schema":{"type":"array","items":{"type":"array","items":{"type":"string"}}}}]}}`, "op", "is an array of arrays"},
+		{"/w1", `{"get":{"operationId":"W1","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/Str","type":"array"}}]}}`, "doc", "type"},
+		{"/w2", `{"get":{"operationId":"W2","requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Str","required":["x"]}}}}}}`, "doc", "required"},
+		{"/w3", `{"get":{"operationId":"W3","parameters":[{"$ref":"#/components/parameters/P","description":"Overrides the text."}]}}`, "doc", "extra sibling fields: [description]"},
+		{"/x1/{id}", `{"parameters":[{"name":"id","in":"path","required":true},{"name":"id","in":"path","required":true}],"get":{"operationId":"X1"}}`, "doc", `more than one "path" parameter has name "id"`},
+		{"/x2", `{"get":{"operationId":"X2","parameters":[{"name":"X-Name","in":"header"},{"name":"x-name","in":"header"}]}}`, "op", `parameter "x-name" in header is declared twice`},
+		{"/y1", `{"get":{"operationId":"Y1","parameters":[{"name":"Host","in":"header"}]}}`, "op", `header parameter "Host" is reserved`},
+		{"/y2", `{"get":{"operationId":"Y2","parameters":[{"name":"user-agent","in":"header"}]}}`, "op", `header parameter "user-agent" is reserved`},
+		{"/y3", `{"get":{"operationId":"Y3","parameters":[{"name":"Cookie","in":"header"}]}}`, "op", "is reserved"},
+		{"/y4", `{"get":{"operationId":"Y4","parameters":[{"name":"X-Trace","in":"header"}]}}`, "", ""},
+		{"/z1", `{"get":{"operationId":"Z1","parameters":[{"name":"a=b","in":"query"}]}}`, "op", `parameter "a=b" has '=' in its name`},
+		{"/z2", `{"get":{"operationId":"Z2","parameters":[{"$ref":"#/paths/~1ok~1%7Bid%7D/get/parameters/-0"}]}}`, "doc", `"-0"`},
+		{"/z7", `{"get":{"operationId":"Z7","parameters":[{"$ref":"#/paths/~1ok~1%7Bid%7D/get/parameters/01"}]}}`, "doc", `"01"`},
+		{"/z3", `{"get":{"operationId":"Z3","servers":[{"url":"{a}","variables":{"a":{"default":"{a}{a}"}}}]}}`, "op", `server variable "a" has braces in its default`},
+		{"/z4", `{"get":{"operationId":"Z4","servers":{"url":"/v2"}}}`, "doc", "cannot unmarshal object into field Operation.servers"},
+		{"/z5", `{"post":{"operationId":"Z5","requestBody":{"content":{"bogus+json":{}}}}}`, "op", "[bogus+json] are not supported"},
+		{"/z6", `{"post":{"operationId":"Z6","requestBody":{"$ref":"#/components/schemas/Num"}}}`, "doc", "expecting ref to requestBody object"},
+	}
+	components := `"components":{"parameters":{"P":{"name":"p","in":"query","schema":{"type":"string"}}},
+		"schemas":{"Str":{"type":"string"},"Num":{"type":"integer"},"Obj":{"type":"object"},"Any":{"anyOf":[{"type":"string"},{"type":"integer"}]}}}`
+	ok := `"/ok/{id}":{"get":{"operationId":"Ok","parameters":[{"name":"id","in":"path","required":true}]}}`
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			spec := fmt.Sprintf(`{"openapi":"3.0.3",%s,"paths":{%q:%s,%s}}`, components, c.path, c.item, ok)
+			srv := specServer(t, spec)
+			e := newEnv(t, srv.URL)
+			r := e.run(t, "operations")
+			if c.level == "doc" {
+				want(t, r, 6)
+				if !strings.Contains(r.Stderr, "invalid OpenAPI description") || !strings.Contains(r.Stderr, c.why) {
+					t.Fatalf("stderr %s, want it to name %s", r.Stderr, c.why)
+				}
+				return
 			}
-			paths = append(paths, fmt.Sprintf("%q:{%s\"get\":%s}", p, level, o.op))
-		}
-		spec := `{"openapi":"3.0.3","components":{
-			"parameters":{"P":{"name":"p","in":"query"}},
-			"schemas":{"A":{"$ref":"#/components/schemas/B"},"B":{"$ref":"#/components/schemas/A"},
-				"Str":{"type":"string"},"Any":{"anyOf":[{"type":"string"},{"type":"integer"}]}}},"paths":{` + strings.Join(paths, ",") + `}}`
+			want(t, r, 0)
+			var got string
+			for _, o := range decode[[]map[string]string](t, r.Stdout) {
+				if o["path"] == c.path {
+					got = o["unsupported"]
+				}
+			}
+			if (c.why == "") != (got == "") || !strings.Contains(got, c.why) {
+				t.Fatalf("unsupported %q, want %q", got, c.why)
+			}
+			want(t, e.run(t, "ok", "--id", "1"), 0)
+		})
+	}
+
+	t.Run("an unsupported operation is refused", func(t *testing.T) {
+		spec := `{"openapi":"3.0.3","paths":{"/a":{"get":{"operationId":"A","parameters":[{"name":"q","in":"query","schema":{"type":"object"}}]}}}}`
 		srv := specServer(t, spec)
 		e := newEnv(t, srv.URL)
-		r := e.run(t, "operations")
-		want(t, r, 0)
-		listed := map[string]string{}
-		for _, o := range decode[[]map[string]string](t, r.Stdout) {
-			listed[o["path"]] = o["unsupported"]
-		}
-		for p, o := range ops {
-			if (o.why == "") != (listed[p] == "") || !strings.Contains(listed[p], o.why) {
-				t.Errorf("%s: unsupported %q, want %q", p, listed[p], o.why)
-			}
-		}
-		r = e.run(t, "a", "--q", "1")
+		r := e.run(t, "a", "--q", "1")
 		want(t, r, 2)
-		if !strings.Contains(r.Stderr, "this CLI cannot call a: parameter") {
+		if !strings.Contains(r.Stderr, `this CLI cannot call a: parameter "q" is an object`) {
 			t.Fatalf("stderr %s", r.Stderr)
 		}
-		if h := decode[map[string]any](t, e.run(t, "help", "c").Stdout); !strings.Contains(fmt.Sprint(h["unsupported"]), "is an object") {
+		if h := decode[map[string]any](t, e.run(t, "help", "a").Stdout); !strings.Contains(fmt.Sprint(h["unsupported"]), "is an object") {
 			t.Fatalf("help %v", h)
 		}
 		if srv.callCount() != 0 {
 			t.Fatal("an unsupported operation reached the server")
 		}
-		want(t, e.run(t, "ok", "--id", "1"), 0)
 	})
 
 	t.Run("raw request bodies", func(t *testing.T) {
@@ -131,22 +149,23 @@ func TestSupportedSubset(t *testing.T) {
 func TestRequestsStayOnOrigin(t *testing.T) {
 	other := newFakeServer(t, false)
 	host := strings.TrimPrefix(other.URL, "http://")
-	spec := fmt.Sprintf(`{"openapi":"3.0.3","servers":[{"url":"/"}],"paths":{
-		"x-@%s/leak":{"get":{"operationId":"Leak"}},
-		"/me":{"get":{"operationId":"GetMe","parameters":[{"name":"session","in":"cookie","required":true}]}}}}`, host)
+	// A path that would put another host in the request URL.
+	for _, path := range []string{"@" + host + "/leak", "/x/../@" + host + "/leak"} {
+		spec := fmt.Sprintf(`{"openapi":"3.0.3","servers":[{"url":"/"}],"paths":{%q:{"get":{"operationId":"Leak"}}}}`, path)
+		e := newEnv(t, specServer(t, spec).URL)
+		e.vars["MAILGLO_TOKEN"] = testToken
+		_ = e.run(t, "leak")
+		if other.callCount() != 0 {
+			t.Fatalf("%s: the other server was called", path)
+		}
+	}
+	spec := `{"openapi":"3.0.3","paths":{"/me":{"get":{"operationId":"GetMe","parameters":[{"name":"session","in":"cookie","required":true}]}}}}`
 	srv := specServer(t, spec, func(f *fakeServer) {
 		f.respond = func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, other.URL+"/me", http.StatusFound)
 		}
 	})
-	e := newEnv(t, srv.URL)
-	e.vars["MAILGLO_TOKEN"] = testToken
-	r := e.run(t, "leak")
-	want(t, r, 2)
-	if !strings.Contains(r.Stderr, "not a plain absolute path") {
-		t.Fatalf("stderr %s", r.Stderr)
-	}
-	r = newEnv(t, srv.URL).run(t, "get-me", "--session", "secret")
+	r := newEnv(t, srv.URL).run(t, "get-me", "--session", "secret")
 	want(t, r, 6)
 	if other.callCount() != 0 {
 		t.Fatal("the session cookie followed a redirect to another origin")
@@ -180,7 +199,8 @@ func TestCacheRefusesInnerLinks(t *testing.T) {
 // Item 3 (round 2): naming and parameter merging stay linear.
 func TestAdversarialNamingIsFast(t *testing.T) {
 	paths := map[string]any{}
-	for i := 0; i < 8000; i++ {
+	n, m := size(8000), size(20000)
+	for i := 0; i < n; i++ {
 		// Every id reduces to the same command name "x".
 		suffix := strings.Map(func(r rune) rune {
 			if r == '0' {
@@ -191,30 +211,38 @@ func TestAdversarialNamingIsFast(t *testing.T) {
 		paths[fmt.Sprintf("/p%d", i)] = map[string]any{"get": map[string]any{"operationId": "X" + suffix}}
 	}
 	var shared, own []any
-	for i := 0; i < 20000; i++ {
+	for i := 0; i < m; i++ {
 		shared = append(shared, map[string]any{"name": fmt.Sprintf("s%d", i), "in": "query"})
 		own = append(own, map[string]any{"name": fmt.Sprintf("o%d", i), "in": "query"})
 	}
 	paths["/wide"] = map[string]any{"parameters": shared, "get": map[string]any{"operationId": "Wide", "parameters": own}}
 	raw, _ := json.Marshal(map[string]any{"openapi": "3.0.3", "paths": paths})
+	raw = completeSpec(raw)
 
+	// Loading and validating is kin-openapi's work; what this CLI adds on
+	// top (parameters, merging, names) must stay well under a second.
 	start := time.Now()
+	if _, err := load(raw, parseTimeout); err != nil {
+		t.Fatal(err)
+	}
+	loading := time.Since(start)
+	start = time.Now()
 	a, err := parseSpec(raw)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if limit := time.Second; !raceEnabled && elapsed > limit {
-		t.Fatalf("parsing took %s", elapsed)
+	if limit := time.Second; !raceEnabled && elapsed-loading > limit {
+		t.Fatalf("parsing took %s, of which loading %s", elapsed, loading)
 	}
-	if len(a.Ops) != 8001 || a.byName["x-get"] == nil || a.byName["x-get-8000"] == nil || a.byName["x-get-8001"] != nil {
+	if len(a.Ops) != n+1 || a.byName["x-get"] == nil || a.byName[fmt.Sprintf("x-get-%d", n)] == nil || a.byName[fmt.Sprintf("x-get-%d", n+1)] != nil {
 		t.Fatalf("names: %d operations", len(a.Ops))
 	}
-	if w := a.byName["wide"]; w == nil || len(w.Params) != 40000 {
+	if w := a.byName["wide"]; w == nil || len(w.Params) != 2*m {
 		t.Fatal("parameters were not merged")
 	}
 
-	r := newEnv(t, specServer(t, string(raw)).URL).run(t, "help", "x-get-4000")
+	r := newEnv(t, specServer(t, string(raw)).URL).run(t, "help", fmt.Sprintf("x-get-%d", n/2))
 	want(t, r, 0)
 }
 
@@ -320,13 +348,14 @@ func TestBuiltinNamesAreReserved(t *testing.T) {
 func TestJSONPointerReferences(t *testing.T) {
 	spec := `{"openapi":"3.0.3",
 		"components":{
-			"requestBodies":{"MyBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/a~1b~0c"}}}}},
-			"schemas":{"a/b~c":{"required":["name"],"properties":{"name":{}}}}},
+			"requestBodies":{"MyBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Named"}}}}},
+			"schemas":{"Named":{"required":["name"],"properties":{"name":{}}}}},
 		"paths":{
 			"/source":{"get":{"operationId":"Source","parameters":[{"name":"must","in":"query","required":true}]}},
+			"/t~x":{"get":{"operationId":"Tilde","parameters":[{"name":"also","in":"query","required":true}]}},
+			"/other":{"get":{"operationId":"Other","parameters":[{"$ref":"#/paths/~1t~0x/get/parameters/0"}]}},
 			"/copy":{"get":{"operationId":"Copy","parameters":[{"$ref":"#/paths/~1source/get/parameters/0"}]},
-				"post":{"operationId":"Make","requestBody":{"$ref":"#/components/requestBodies/My%42ody"}}},
-			"/bad":{"get":{"operationId":"Bad","parameters":[{"$ref":"#/paths/~1source/get/parameters/01"}]}}}}`
+				"post":{"operationId":"Make","requestBody":{"$ref":"#/components/requestBodies/My%42ody"}}}}}`
 	srv := specServer(t, spec)
 	e := newEnv(t, srv.URL)
 	want(t, e.run(t, "copy"), 2) // the referenced required parameter is enforced
@@ -338,10 +367,14 @@ func TestJSONPointerReferences(t *testing.T) {
 	if fmt.Sprint(info["body_fields"]) != "[name]" || info["body_needed"] != true {
 		t.Fatalf("help %v", info)
 	}
-	want(t, e.run(t, "make"), 2) // the referenced body is required
-	r := e.run(t, "bad")
-	want(t, r, 2)
-	if !strings.Contains(r.Stderr, `invalid array index "01"`) {
+	want(t, e.run(t, "make"), 2)  // the referenced body is required
+	want(t, e.run(t, "other"), 2) // ~0 and ~1 in a pointer
+	want(t, e.run(t, "other", "--also", "1"), 0)
+	bad := `{"openapi":"3.0.3","paths":{"/source":{"get":{"operationId":"Source","parameters":[{"name":"must","in":"query"}]}},
+		"/bad":{"get":{"operationId":"Bad","parameters":[{"$ref":"#/paths/~1source/get/parameters/01"}]}}}}`
+	r := newEnv(t, specServer(t, bad).URL).run(t, "bad")
+	want(t, r, 6)
+	if !strings.Contains(r.Stderr, `"01"`) {
 		t.Fatalf("stderr %s", r.Stderr)
 	}
 }

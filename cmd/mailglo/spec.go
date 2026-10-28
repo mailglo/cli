@@ -1,21 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
 )
 
-// This file reads an OpenAPI description (JSON) into the operations the CLI
-// can call. It accepts the subset documented under "Supported API
-// descriptions" in README.md. A document outside it is refused; an
-// operation outside it is kept, marked unsupported with the construct that
-// put it there, and refused when someone runs it.
+// This file turns an OpenAPI description (JSON) into the operations the CLI
+// can call. kin-openapi loads and validates the document and resolves its
+// references; this file then applies the subset documented under
+// "Supported API descriptions" in README.md. A document that does not load
+// or validate is refused. An operation outside the subset is kept, marked
+// unsupported with the construct that put it there, and refused when
+// someone runs it.
 
 type api struct {
 	Ops    []*operation // sorted by Name
@@ -35,17 +41,6 @@ type operation struct {
 	byLoc  map[[2]string]int // parameter index by location and name
 }
 
-// index builds the flag lookup tables once, so resolving a flag costs the
-// same whatever the number of parameters.
-func (o *operation) index() {
-	o.byName = make(map[string][]int, len(o.Params))
-	o.byLoc = make(map[[2]string]int, len(o.Params))
-	for i, p := range o.Params {
-		o.byName[p.Name] = append(o.byName[p.Name], i)
-		o.byLoc[[2]string{p.In, p.Name}] = i
-	}
-}
-
 type param struct {
 	Name, In, Description string
 	Required              bool
@@ -63,70 +58,84 @@ type body struct {
 	RequiredFields []string // required top-level JSON fields, sorted
 }
 
-var methods = []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+// index builds the flag lookup tables once, so resolving a flag costs the
+// same whatever the number of parameters.
+func (o *operation) index() {
+	o.byName = make(map[string][]int, len(o.Params))
+	o.byLoc = make(map[[2]string]int, len(o.Params))
+	for i, p := range o.Params {
+		o.byName[p.Name] = append(o.byName[p.Name], i)
+		o.byLoc[[2]string{p.In, p.Name}] = i
+	}
+}
 
 // builtins are CLI commands; no operation is named after one.
 var builtins = []string{"help", "operations", "version"}
 
-// maxSteps bounds the work spent on one description (references,
-// schemas, parameters and naming), so a hostile one cannot make the CLI spin.
-const maxSteps = 1_000_000
+const (
+	// maxSpecBytes caps the description before it is parsed.
+	maxSpecBytes = 16 << 20
+	// parseTimeout bounds loading and validating it.
+	parseTimeout = 20 * time.Second
+	// maxSteps bounds the work after loading: parameters, body fields and
+	// names.
+	maxSteps = 4_000_000
+	// maxNameBytes caps a generated command name.
+	maxNameBytes = 200
+)
 
 var errTooComplex = errors.New("description is too complex")
 
 // parseSpec reads an OpenAPI description. The result does not depend on map
 // iteration order.
 func parseSpec(raw []byte) (*api, error) {
-	var root map[string]any
-	if err := json.Unmarshal(raw, &root); err != nil {
+	return parseSpecWithin(raw, parseTimeout)
+}
+
+func parseSpecWithin(raw []byte, timeout time.Duration) (*api, error) {
+	if len(raw) > maxSpecBytes {
+		return nil, fmt.Errorf("description is larger than %d bytes", maxSpecBytes)
+	}
+	var head struct {
+		OpenAPI string `json:"openapi"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
 		return nil, err
 	}
-	v, _ := root["openapi"].(string)
-	if !strings.HasPrefix(v, "3.0.") && !strings.HasPrefix(v, "3.1.") {
-		return nil, fmt.Errorf("OpenAPI version %q is not supported; use 3.0 or 3.1", v)
+	if !strings.HasPrefix(head.OpenAPI, "3.0.") && !strings.HasPrefix(head.OpenAPI, "3.1.") {
+		return nil, fmt.Errorf("OpenAPI version %q is not supported; use 3.0 or 3.1", short(head.OpenAPI))
 	}
-	paths, ok := root["paths"].(map[string]any)
-	if !ok {
-		return nil, errors.New("no paths object")
+	doc, err := load(raw, timeout)
+	if err != nil {
+		return nil, err
 	}
-	r := &resolver{root: root, steps: maxSteps}
-	rootServer, rootErr := r.server(root["servers"])
+	b := &budget{steps: maxSteps, fields: map[*openapi3.Schema]fieldList{}}
 	a := &api{}
+	rootServer, rootErr := server(doc.Servers)
+	paths := doc.Paths.Map()
 	for _, path := range sortedKeys(paths) {
-		item := r.object(paths[path])
-		if err := r.take(); err != nil {
-			return nil, fmt.Errorf("path %q: %w", path, err)
-		}
+		item := paths[path]
 		if item == nil {
 			continue
 		}
-		pathErr := checkPath(path)
-		shared := r.params(item["parameters"])
-		pathServer, pathServerErr := r.server(item["servers"])
-		for _, e := range []error{r.take(), pathServerErr} {
-			if pathErr == nil {
-				pathErr = e
-			}
-		}
-		for _, m := range methods {
-			op := r.object(item[m])
-			if op == nil && r.err == nil {
-				continue
-			}
-			o := &operation{Method: strings.ToUpper(m), Path: path}
-			o.ID, _ = op["operationId"].(string)
-			o.Summary, _ = op["summary"].(string)
-			o.Params = r.merge(shared, r.params(op["parameters"]))
+		shared, sharedErr := b.params(item.Parameters)
+		pathServer, pathServerErr := server(item.Servers)
+		pathErr := firstErr(checkPath(path), sharedErr, pathServerErr)
+		ops := item.Operations()
+		for _, m := range sortedKeys(ops) {
+			op := ops[m]
+			o := &operation{Method: m, Path: path, ID: op.OperationID, Summary: op.Summary}
+			own, ownErr := b.params(op.Parameters)
+			o.Params = b.merge(shared, own)
 			o.index()
-			r.spend(2 * len(o.Params))
-			o.Body = r.body(op["requestBody"])
-			opServer, opServerErr := r.server(op["servers"])
-			err := pathErr
-			for _, e := range []error{r.take(), opServerErr, checkTemplate(path, o.Params)} {
-				if err == nil {
-					err = e
-				}
+			var bodyErr error
+			o.Body, bodyErr = b.body(op.RequestBody)
+			var opServer string
+			var opServerErr error
+			if op.Servers != nil {
+				opServer, opServerErr = server(*op.Servers)
 			}
+			e := firstErr(pathErr, ownErr, bodyErr, opServerErr, checkTemplate(path, o.Params))
 			switch {
 			case opServer != "":
 				o.ServerURL = opServer
@@ -134,28 +143,83 @@ func parseSpec(raw []byte) (*api, error) {
 				o.ServerURL = pathServer
 			default:
 				o.ServerURL = rootServer
-				if err == nil {
-					err = rootErr
-				}
+				e = firstErr(e, rootErr)
 			}
-			if err != nil {
-				o.Unsupported = err.Error()
+			if e != nil {
+				o.Unsupported = e.Error()
 			}
 			a.Ops = append(a.Ops, o)
+			if !b.spend(1) {
+				return nil, errTooComplex
+			}
 		}
 	}
-	a.name(r)
-	if r.steps < 0 {
+	a.name(b)
+	if b.steps < 0 {
 		return nil, errTooComplex
 	}
 	return a, nil
+}
+
+// load runs kin-openapi's loader and validator under a deadline. Only
+// references inside the document are followed.
+func load(raw []byte, timeout time.Duration) (*openapi3.T, error) {
+	type result struct {
+		doc *openapi3.T
+		err error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	done := make(chan result, 1)
+	go func() {
+		loader := openapi3.NewLoader()
+		loader.IsExternalRefsAllowed = false
+		loader.Context = ctx
+		doc, err := loader.LoadFromData(raw)
+		if err == nil {
+			err = doc.Validate(ctx)
+		}
+		done <- result{doc, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, fmt.Errorf("invalid OpenAPI description: %s", shortN(r.err.Error(), 300))
+		}
+		if r.doc.Paths == nil {
+			return nil, errors.New("no paths object")
+		}
+		return r.doc, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: reading it took longer than %s", errTooComplex, timeout)
+	}
+}
+
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// budget bounds the work after loading and remembers schema field lists.
+type budget struct {
+	steps  int
+	fields map[*openapi3.Schema]fieldList
+}
+
+func (b *budget) spend(n int) bool {
+	b.steps -= n
+	return b.steps >= 0
 }
 
 // checkPath accepts only plain absolute paths, so a path cannot add a query,
 // a fragment or an authority to the request URL.
 func checkPath(path string) error {
 	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") || strings.ContainsAny(path, "?#\\ ") || hasControl(path) {
-		return fmt.Errorf("path %q is not a plain absolute path", path)
+		return fmt.Errorf("path %q is not a plain absolute path", short(path))
 	}
 	return nil
 }
@@ -171,7 +235,7 @@ func checkTemplate(path string, params []param) error {
 		}
 		j := strings.IndexByte(rest[i:], '}')
 		if rest[i] == '}' || j < 0 {
-			return fmt.Errorf("path %q has unbalanced braces", path)
+			return fmt.Errorf("path %q has unbalanced braces", short(path))
 		}
 		vars[rest[i+1:i+j]] = true
 		rest = rest[i+j+1:]
@@ -179,36 +243,37 @@ func checkTemplate(path string, params []param) error {
 	for _, p := range params {
 		if p.In == "path" {
 			if !vars[p.Name] {
-				return fmt.Errorf("path parameter %q is not in the path", p.Name)
+				return fmt.Errorf("path parameter %q is not in the path", short(p.Name))
 			}
 			delete(vars, p.Name)
 		}
 	}
 	if left := sortedKeys(vars); len(left) > 0 {
-		return fmt.Errorf("path variable {%s} has no path parameter", left[0])
+		return fmt.Errorf("path variable {%s} has no path parameter", short(left[0]))
 	}
 	return nil
 }
 
 // name gives every operation a unique command name. It is the kebab-case
-// operationId, or method and path when there is none. A name that clashes
-// with another operation's or with a built-in command gets the method
-// appended, then a number.
-func (a *api) name(r *resolver) {
+// operationId, or method and path when there is none, at most maxNameBytes
+// long. A name that clashes with another operation's or with a built-in
+// command gets the method appended, then a number.
+func (a *api) name(b *budget) {
 	base := make(map[*operation]string, len(a.Ops))
 	count := map[string]int{}
 	for _, o := range a.Ops {
-		b := commandName(o.ID)
-		if b == "" {
-			b = commandName(strings.ToLower(o.Method) + "-" + o.Path)
+		n := commandName(o.ID)
+		if n == "" {
+			n = commandName(strings.ToLower(o.Method) + "-" + o.Path)
 		}
-		if b == "" {
-			b = "operation"
+		if n == "" {
+			n = "operation"
 		}
-		base[o] = b
-		count[b]++
+		b.spend(len(n))
+		base[o] = n
+		count[n]++
 	}
-	r.spend(len(a.Ops) * 20) // sorting
+	b.spend(len(a.Ops) * 20) // sorting
 	sort.SliceStable(a.Ops, func(i, j int) bool {
 		x, y := a.Ops[i], a.Ops[j]
 		if base[x] != base[y] {
@@ -223,13 +288,13 @@ func (a *api) name(r *resolver) {
 		return x.ID < y.ID
 	})
 	used := map[string]bool{}
-	for _, b := range builtins {
-		used[b] = true
+	for _, n := range builtins {
+		used[n] = true
 	}
 	for _, o := range a.Ops { // unique names first, so a suffixed name cannot take one
-		if b := base[o]; count[b] == 1 && !used[b] {
-			o.Name = b
-			used[b] = true
+		if n := base[o]; count[n] == 1 && !used[n] {
+			o.Name = n
+			used[n] = true
 		}
 	}
 	next := map[string]int{} // next number to try for each suffixed name
@@ -237,12 +302,12 @@ func (a *api) name(r *resolver) {
 		if o.Name != "" {
 			continue
 		}
-		r.spend(1)
 		name := base[o] + "-" + strings.ToLower(o.Method)
+		b.spend(len(name))
 		if used[name] {
 			cand := name
 			n := max(next[cand], 2)
-			for used[fmt.Sprintf("%s-%d", cand, n)] && r.spend(1) {
+			for used[fmt.Sprintf("%s-%d", cand, n)] && b.spend(1) {
 				n++
 			}
 			name = fmt.Sprintf("%s-%d", cand, n)
@@ -284,17 +349,24 @@ func (a *api) lookup(s string) (*operation, error) {
 		for _, o := range list {
 			names = append(names, o.Name)
 		}
-		return nil, fmt.Errorf("%q matches several operations: %s", s, strings.Join(names, ", "))
+		return nil, fmt.Errorf("%q matches several operations: %s", short(s), strings.Join(names, ", "))
 	}
-	return nil, fmt.Errorf("unknown operation %q; run: mailglo operations", s)
+	return nil, fmt.Errorf("unknown operation %q; run: mailglo operations", short(s))
 }
 
 // commandName turns an operationId, or "method-/path/{param}", into a
-// lower-case name made of letters, digits, '-', '_' and '.'.
+// lower-case name made of letters, digits, '-', '_' and '.', at most
+// maxNameBytes long. Only the start of a long input is read.
 func commandName(s string) string {
+	if len(s) > 2*maxNameBytes {
+		s = s[:2*maxNameBytes]
+	}
 	var b strings.Builder
 	dash := false
 	for _, r := range kebab(s) {
+		if b.Len() >= maxNameBytes {
+			break
+		}
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '.':
 			b.WriteRune(r)
@@ -307,29 +379,27 @@ func commandName(s string) string {
 	return strings.TrimRight(b.String(), "-")
 }
 
-// server returns the first URL of a "servers" list with its variables set
-// to their defaults, or "" for an absent or empty list.
-func (r *resolver) server(v any) (string, error) {
-	list, _ := v.([]any)
-	if len(list) == 0 {
+// server returns the first server URL with its variables set to their
+// defaults, or "" when there is none.
+func server(list openapi3.Servers) (string, error) {
+	if len(list) == 0 || list[0] == nil {
 		return "", nil
 	}
-	s, _ := list[0].(map[string]any)
-	u, ok := s["url"].(string)
-	if !ok {
-		return "", errors.New("a server has no url")
+	vars := map[string]string{}
+	for name, v := range list[0].Variables {
+		if v != nil {
+			vars[name] = v.Default
+		}
 	}
-	vars, _ := s["variables"].(map[string]any)
-	u, err := expandServer(u, vars)
-	r.spend(len(u))
+	u, err := expandServer(list[0].URL, vars)
 	if err != nil {
 		return "", err
 	}
 	if hasControl(u) {
-		return "", fmt.Errorf("server URL %q has a control character", u)
+		return "", fmt.Errorf("server URL %q has a control character", short(u))
 	}
 	if _, err := url.Parse(u); err != nil {
-		return "", fmt.Errorf("server URL %q is not a URL", u)
+		return "", fmt.Errorf("server URL %q is not a URL", short(u))
 	}
 	if u == "" {
 		u = "/"
@@ -342,7 +412,7 @@ const maxServerURL = 2048
 
 // expandServer replaces each {name} in a server URL with the variable's
 // default, in one pass: a default is never expanded again.
-func expandServer(u string, vars map[string]any) (string, error) {
+func expandServer(u string, vars map[string]string) (string, error) {
 	var b strings.Builder
 	rest := u
 	for {
@@ -356,8 +426,7 @@ func expandServer(u string, vars map[string]any) (string, error) {
 			return "", fmt.Errorf("server URL %q has unbalanced braces", short(u))
 		}
 		name := rest[i+1 : i+j]
-		m, _ := vars[name].(map[string]any)
-		def, ok := m["default"].(string)
+		def, ok := vars[name]
 		if !ok {
 			return "", fmt.Errorf("server URL %q has a variable without a default", short(u))
 		}
@@ -378,156 +447,41 @@ func expandServer(u string, vars map[string]any) (string, error) {
 }
 
 // short trims text from the description for a diagnostic.
-func short(s string) string {
-	if len(s) <= 80 {
+func short(s string) string { return shortN(s, 80) }
+
+func shortN(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	return s[:77] + "..."
+	return s[:n-3] + "..."
+}
+
+// paramKey identifies a parameter for duplicates and overrides. Header
+// names are compared the way HTTP sends them.
+func paramKey(in, name string) [2]string {
+	if in == "header" {
+		name = http.CanonicalHeaderKey(name)
+	}
+	return [2]string{in, name}
 }
 
 // merge lets operation parameters override path-level ones with the same
-// name and location.
-func (r *resolver) merge(shared, own []param) []param {
-	r.spend(len(shared) + len(own))
+// location and name.
+func (b *budget) merge(shared, own []param) []param {
+	b.spend(len(shared) + len(own))
 	seen := make(map[[2]string]bool, len(own))
 	out := make([]param, 0, len(own)+len(shared))
 	for _, p := range own {
-		seen[[2]string{p.In, p.Name}] = true
+		seen[paramKey(p.In, p.Name)] = true
 		out = append(out, p)
 	}
 	for _, s := range shared {
-		if key := [2]string{s.In, s.Name}; !seen[key] {
-			seen[key] = true
+		if k := paramKey(s.In, s.Name); !seen[k] {
+			seen[k] = true
 			out = append(out, s)
 		}
 	}
 	return out
-}
-
-// resolver follows local references and records the first error since the
-// last take.
-type resolver struct {
-	root  map[string]any
-	steps int
-	err   error
-}
-
-func (r *resolver) spend(n int) bool {
-	r.steps -= n
-	return r.steps >= 0
-}
-
-func (r *resolver) fail(err error) {
-	if r.err == nil {
-		r.err = err
-	}
-}
-
-func (r *resolver) take() error {
-	err := r.err
-	r.err = nil
-	return err
-}
-
-// object follows $ref chains and returns the JSON object they end at, or
-// nil for an absent value. A reference that cannot be resolved is an error.
-func (r *resolver) object(v any) map[string]any {
-	for depth := 0; depth < 32; depth++ {
-		if !r.spend(1) {
-			return nil
-		}
-		m, ok := v.(map[string]any)
-		if !ok {
-			return nil
-		}
-		ref, ok := m["$ref"].(string)
-		if !ok {
-			return m
-		}
-		// A Reference Object may carry only a summary and a description.
-		// Anything else beside $ref (allowed for schemas in OpenAPI 3.1)
-		// would have to be merged, which this CLI does not do.
-		for k := range m {
-			if k != "$ref" && k != "summary" && k != "description" {
-				r.fail(fmt.Errorf("reference %q has sibling %q; $ref with other keys is not supported", ref, k))
-				return nil
-			}
-		}
-		target, err := r.pointer(ref)
-		if err != nil {
-			r.fail(err)
-			return nil
-		}
-		v = target
-	}
-	r.fail(errors.New("reference chain is too long or circular"))
-	return nil
-}
-
-// pointer resolves a local reference: a URI fragment holding a JSON
-// Pointer (RFC 6901), percent-decoded, with ~1 for '/' and ~0 for '~'.
-func (r *resolver) pointer(ref string) (any, error) {
-	frag, ok := strings.CutPrefix(ref, "#")
-	if !ok {
-		return nil, fmt.Errorf("reference %q is not local; only #/... references are supported", ref)
-	}
-	p, err := url.PathUnescape(frag)
-	if err != nil {
-		return nil, fmt.Errorf("reference %q is not a valid URI fragment", ref)
-	}
-	if p == "" {
-		return any(r.root), nil
-	}
-	if !strings.HasPrefix(p, "/") {
-		return nil, fmt.Errorf("reference %q is not a JSON Pointer", ref)
-	}
-	var cur any = r.root
-	for _, tok := range strings.Split(p[1:], "/") {
-		if !r.spend(1) {
-			return nil, errTooComplex
-		}
-		if strings.Contains(strings.ReplaceAll(strings.ReplaceAll(tok, "~0", ""), "~1", ""), "~") {
-			return nil, fmt.Errorf("reference %q has an invalid ~ escape", ref)
-		}
-		tok = strings.ReplaceAll(strings.ReplaceAll(tok, "~1", "/"), "~0", "~")
-		switch c := cur.(type) {
-		case map[string]any:
-			next, ok := c[tok]
-			if !ok {
-				return nil, fmt.Errorf("reference %q does not resolve", ref)
-			}
-			cur = next
-		case []any:
-			if !arrayIndex(tok) {
-				return nil, fmt.Errorf("reference %q has an invalid array index %q", ref, tok)
-			}
-			i, err := strconv.Atoi(tok)
-			if err != nil || i >= len(c) {
-				return nil, fmt.Errorf("reference %q does not resolve", ref)
-			}
-			cur = c[i]
-		default:
-			return nil, fmt.Errorf("reference %q does not resolve", ref)
-		}
-	}
-	return cur, nil
-}
-
-// arrayIndex reports whether tok is a JSON Pointer array index:
-// 0|[1-9][0-9]*.
-func arrayIndex(tok string) bool {
-	if tok == "0" {
-		return true
-	}
-	if tok == "" || tok[0] < '1' || tok[0] > '9' || len(tok) > 9 {
-		return false
-	}
-	for _, c := range []byte(tok) {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 // reservedHeaders are set by the CLI or by HTTP itself; a header parameter
@@ -547,187 +501,201 @@ var styles = map[string][]string{
 	"cookie": {"form"},
 }
 
-func (r *resolver) params(v any) []param {
-	var list []any
-	switch t := v.(type) {
-	case nil:
-	case []any:
-		list = t
-	default:
-		r.fail(errors.New("parameters is not a list"))
-	}
+// params converts a parameter list, returning the first construct outside
+// the subset.
+func (b *budget) params(list openapi3.Parameters) ([]param, error) {
+	b.spend(len(list))
 	var out []param
+	var first error
+	fail := func(err error) {
+		if first == nil {
+			first = err
+		}
+	}
 	seen := map[[2]string]bool{}
-	for _, item := range list {
-		p := r.object(item)
-		if p == nil {
+	for _, ref := range list {
+		if ref == nil || ref.Value == nil {
+			fail(errors.New("a parameter does not resolve"))
 			continue
 		}
-		name, _ := p["name"].(string)
-		in, _ := p["in"].(string)
-		if name == "" || in == "" {
-			r.fail(errors.New("a parameter has no name or location"))
-			continue
-		}
-		if seen[[2]string{in, name}] {
-			r.fail(fmt.Errorf("parameter %q in %s is declared twice", name, in))
-			continue
-		}
-		seen[[2]string{in, name}] = true
-		if strings.Contains(name, "=") {
-			r.fail(fmt.Errorf("parameter %q has '=' in its name, which a flag cannot carry", name))
-		}
-		if in == "header" && reservedHeaders[http.CanonicalHeaderKey(name)] {
-			r.fail(fmt.Errorf("header parameter %q is reserved: the CLI or HTTP sets it", name))
-		}
+		p := ref.Value
+		name, in := p.Name, p.In
 		allowed, ok := styles[in]
 		if !ok {
-			r.fail(fmt.Errorf("parameter %q is in %q; supported locations are path, query, header and cookie", name, in))
+			fail(fmt.Errorf("parameter %q is in %q; supported locations are path, query, header and cookie", short(name), short(in)))
 			continue
 		}
-		if _, ok := p["content"]; ok {
-			r.fail(fmt.Errorf("parameter %q uses content instead of schema", name))
+		k := paramKey(in, name)
+		if seen[k] {
+			fail(fmt.Errorf("parameter %q in %s is declared twice", short(name), in))
+			continue
 		}
-		if b, _ := p["allowReserved"].(bool); b {
-			r.fail(fmt.Errorf("parameter %q uses allowReserved", name))
-		}
-		if (in == "header" || in == "cookie") && !validToken(name) {
-			r.fail(fmt.Errorf("%s parameter %q has an invalid name", in, name))
-		}
-		desc, _ := p["description"].(string)
-		req, _ := p["required"].(bool)
-		style, _ := p["style"].(string)
-		if style == "" {
-			style = allowed[0]
-		}
-		if !contains(allowed, style) {
-			r.fail(fmt.Errorf("%s parameter %q uses style %q; supported: %s", in, name, style, strings.Join(allowed, ", ")))
-		}
-		explode, ok := p["explode"].(bool)
-		if !ok {
-			explode = style == "form"
-		}
-		array, object := r.schemaKind(name, p["schema"])
+		seen[k] = true
 		switch {
-		case object:
-			r.fail(fmt.Errorf("parameter %q is an object", name))
+		case strings.Contains(name, "="):
+			fail(fmt.Errorf("parameter %q has '=' in its name, which a flag cannot carry", short(name)))
+		case in == "header" && reservedHeaders[http.CanonicalHeaderKey(name)]:
+			fail(fmt.Errorf("header parameter %q is reserved: the CLI or HTTP sets it", short(name)))
+		case (in == "header" || in == "cookie") && !validToken(name):
+			fail(fmt.Errorf("%s parameter %q has an invalid name", in, short(name)))
+		case p.Content != nil:
+			fail(fmt.Errorf("parameter %q uses content instead of schema", short(name)))
+		case p.AllowReserved:
+			fail(fmt.Errorf("parameter %q uses allowReserved", short(name)))
+		}
+		sm, err := p.SerializationMethod()
+		if err != nil {
+			fail(err)
+			continue
+		}
+		if !contains(allowed, sm.Style) {
+			fail(fmt.Errorf("%s parameter %q uses style %q; supported: %s", in, short(name), short(sm.Style), strings.Join(allowed, ", ")))
+		}
+		array, err := paramShape(name, p.Schema)
+		if err != nil {
+			fail(err)
+		}
+		switch {
 		case array && in == "cookie":
-			r.fail(fmt.Errorf("cookie parameter %q is an array", name))
-		case !array && (style == "spaceDelimited" || style == "pipeDelimited"):
-			r.fail(fmt.Errorf("query parameter %q uses style %q but is not an array", name, style))
+			fail(fmt.Errorf("cookie parameter %q is an array", short(name)))
+		case !array && (sm.Style == "spaceDelimited" || sm.Style == "pipeDelimited"):
+			fail(fmt.Errorf("query parameter %q uses style %q but is not an array", short(name), sm.Style))
 		}
-		out = append(out, param{Name: name, In: in, Description: desc, Required: req || in == "path",
-			Array: array, Style: style, Explode: explode})
+		out = append(out, param{Name: name, In: in, Description: p.Description, Required: p.Required || in == "path",
+			Array: array, Style: sm.Style, Explode: sm.Explode})
 	}
-	return out
+	return out, first
 }
 
-// schemaKind reports whether a parameter schema is an array or an object.
-// Composed schemas are refused, since their shape is not one type.
-func (r *resolver) schemaKind(name string, v any) (array, object bool) {
-	s := r.object(v)
-	for _, k := range []string{"allOf", "oneOf", "anyOf", "not"} {
-		if _, ok := s[k]; ok {
-			r.fail(fmt.Errorf("parameter %q has a schema using %s", name, k))
-		}
+// paramShape accepts a scalar schema, or an array of scalars.
+func paramShape(name string, ref *openapi3.SchemaRef) (array bool, err error) {
+	if ref == nil || ref.Value == nil {
+		return false, nil
 	}
-	is := func(want string) bool {
-		switch t := s["type"].(type) {
-		case string:
-			return t == want
-		case []any: // OpenAPI 3.1 type lists
-			for _, x := range t {
-				if x == want {
-					return true
-				}
-			}
-		}
-		return false
+	s := ref.Value
+	if err := scalar(name, s, true); err != nil {
+		return false, err
 	}
-	return is("array"), is("object") || s["properties"] != nil
+	if !s.Type.Includes("array") {
+		return false, nil
+	}
+	if s.Items == nil || s.Items.Value == nil {
+		return true, nil
+	}
+	return true, scalar(name+" items", s.Items.Value, false)
 }
 
-// jsonMediaType reports whether a media type is JSON: application/json or
-// any type with a +json suffix, such as application/merge-patch+json.
-func jsonMediaType(mt string) bool {
-	mt = strings.ToLower(strings.TrimSpace(strings.SplitN(mt, ";", 2)[0]))
-	return mt == "application/json" || strings.HasSuffix(mt, "+json")
-}
-
-// mediaRank orders the request media types the CLI can send: JSON first,
-// then raw bytes. Zero means unsupported.
-func mediaRank(mt string) int {
+// scalar refuses composed, conditional, object and (unless allowArray)
+// array schemas.
+func scalar(name string, s *openapi3.Schema, allowArray bool) error {
 	switch {
-	case strings.EqualFold(mt, "application/json"):
+	case len(s.AllOf) > 0:
+		return fmt.Errorf("parameter %q has a schema using allOf", short(name))
+	case len(s.OneOf) > 0:
+		return fmt.Errorf("parameter %q has a schema using oneOf", short(name))
+	case len(s.AnyOf) > 0:
+		return fmt.Errorf("parameter %q has a schema using anyOf", short(name))
+	case s.Not != nil:
+		return fmt.Errorf("parameter %q has a schema using not", short(name))
+	case s.If != nil || len(s.PrefixItems) > 0 || len(s.DependentSchemas) > 0:
+		return fmt.Errorf("parameter %q has a conditional or tuple schema", short(name))
+	case s.Type.Includes("object") || len(s.Properties) > 0 || s.AdditionalProperties.Has != nil || s.AdditionalProperties.Schema != nil:
+		return fmt.Errorf("parameter %q is an object", short(name))
+	case !allowArray && s.Type.Includes("array"):
+		return fmt.Errorf("parameter %q is an array of arrays", short(name))
+	}
+	return nil
+}
+
+// mediaKind classifies a declared media type: 3 application/json, 2 another
+// JSON type (+json), 1 application/octet-stream, 0 unsupported.
+func mediaKind(mt string) int {
+	t, _, err := mime.ParseMediaType(mt)
+	if err != nil {
+		return 0
+	}
+	typ, sub, ok := strings.Cut(t, "/")
+	switch {
+	case !ok || typ == "" || sub == "" || strings.Contains(sub, "/"):
+		return 0
+	case t == "application/json":
 		return 3
-	case jsonMediaType(mt):
+	case strings.HasSuffix(sub, "+json") && len(sub) > len("+json"):
 		return 2
-	case strings.EqualFold(mt, "application/octet-stream"):
+	case t == "application/octet-stream":
 		return 1
 	}
 	return 0
 }
 
-func (r *resolver) body(v any) *body {
-	rb := r.object(v)
-	if rb == nil {
-		return nil
+// jsonMediaType reports whether a media type is a JSON type.
+func jsonMediaType(mt string) bool { return mediaKind(mt) >= 2 }
+
+func (b *budget) body(ref *openapi3.RequestBodyRef) (*body, error) {
+	if ref == nil {
+		return nil, nil
 	}
-	b := &body{}
-	b.Required, _ = rb["required"].(bool)
-	content := r.object(rb["content"])
-	b.Declared = sortedKeys(content)
-	for _, mt := range b.Declared {
-		if mediaRank(mt) > mediaRank(b.MediaType) {
-			b.MediaType = mt
+	if ref.Value == nil {
+		return nil, errors.New("the request body does not resolve")
+	}
+	rb := ref.Value
+	out := &body{Required: rb.Required, Declared: sortedKeys(rb.Content)}
+	b.spend(len(out.Declared))
+	for _, mt := range out.Declared {
+		if mediaKind(mt) > mediaKind(out.MediaType) {
+			out.MediaType = mt
 		}
 	}
-	if b.MediaType == "" {
-		r.fail(fmt.Errorf("request body media types [%s] are not supported; supported: application/json, */*+json, application/octet-stream",
-			strings.Join(b.Declared, ", ")))
-		return b
+	if mediaKind(out.MediaType) == 0 {
+		out.MediaType = ""
+		var names []string
+		for _, mt := range out.Declared {
+			names = append(names, short(mt))
+		}
+		return out, fmt.Errorf("request body media types [%s] are not supported; supported: application/json, */*+json, application/octet-stream",
+			strings.Join(names, ", "))
 	}
-	b.JSON = jsonMediaType(b.MediaType)
-	if !b.JSON {
-		return b
+	out.JSON = jsonMediaType(out.MediaType)
+	if mt := rb.Content[out.MediaType]; out.JSON && mt != nil && mt.Schema != nil && mt.Schema.Value != nil {
+		f := b.bodyFields(mt.Schema.Value)
+		out.Fields, out.RequiredFields = f.fields, f.required
 	}
-	fields, required := map[string]bool{}, map[string]bool{}
-	r.collect(r.object(content[b.MediaType])["schema"], fields, required, map[string]bool{})
-	b.Fields, b.RequiredFields = sortedKeys(fields), sortedKeys(required)
-	return b
+	return out, nil
 }
 
-// collect gathers top-level properties, including those combined with allOf.
-// Each referenced schema is visited once, so repeated or cyclic references
-// cost nothing extra.
-func (r *resolver) collect(v any, fields, required map[string]bool, seen map[string]bool) {
-	if m, ok := v.(map[string]any); ok {
-		if ref, ok := m["$ref"].(string); ok {
-			if seen[ref] {
-				return
+type fieldList struct{ fields, required []string }
+
+// bodyFields lists a body schema's top-level properties, including those of
+// its allOf members. Each schema is visited once, and the result is shared
+// by every operation that uses the schema.
+func (b *budget) bodyFields(s *openapi3.Schema) fieldList {
+	if f, ok := b.fields[s]; ok {
+		return f
+	}
+	names, required := map[string]bool{}, map[string]bool{}
+	seen := map[*openapi3.Schema]bool{}
+	var walk func(*openapi3.Schema)
+	walk = func(s *openapi3.Schema) {
+		if s == nil || seen[s] || !b.spend(1+len(s.Properties)+len(s.Required)+len(s.AllOf)) {
+			return
+		}
+		seen[s] = true
+		for k := range s.Properties {
+			names[k] = true
+		}
+		for _, k := range s.Required {
+			required[k] = true
+		}
+		for _, sub := range s.AllOf {
+			if sub != nil {
+				walk(sub.Value)
 			}
-			seen[ref] = true
 		}
 	}
-	s := r.object(v)
-	if s == nil {
-		return
-	}
-	for k := range r.object(s["properties"]) {
-		fields[k] = true
-	}
-	if req, ok := s["required"].([]any); ok {
-		for _, k := range req {
-			if name, ok := k.(string); ok {
-				required[name] = true
-			}
-		}
-	}
-	if all, ok := s["allOf"].([]any); ok {
-		for _, sub := range all {
-			r.collect(sub, fields, required, seen)
-		}
-	}
+	walk(s)
+	f := fieldList{sortedKeys(names), sortedKeys(required)}
+	b.fields[s] = f
+	return f
 }
 
 func contains(list []string, s string) bool {
@@ -746,12 +714,4 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// validSpec reports whether raw is an OpenAPI description the CLI can use.
-func validSpec(raw []byte) error {
-	if _, err := parseSpec(raw); err != nil {
-		return fmt.Errorf("not a usable OpenAPI description: %w", err)
-	}
-	return nil
 }
