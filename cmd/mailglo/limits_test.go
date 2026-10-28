@@ -4,8 +4,10 @@ package main
 // description, and output is capped.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -101,4 +103,78 @@ func TestOutputBudget(t *testing.T) {
 	if r.Stdout != "" || !strings.Contains(r.Stderr, "help for w would be larger than 8 MiB") {
 		t.Fatalf("stdout %d bytes, stderr %s", len(r.Stdout), r.Stderr)
 	}
+}
+
+// The streaming encoder prints exactly what json.Encoder would, with C1
+// characters escaped.
+func TestStreamingEncoderMatchesEncodingJSON(t *testing.T) {
+	values := []any{
+		map[string]any{"a": "x y\u0085z<&>", "b": true, "c": []map[string]any{{"k": "v", "n": 1}, {}},
+			"d": []string(nil), "e": []string{}, "f": []string{"p", "q"}, "g": map[string]any{}, "h": nil},
+		[]map[string]string{{"operation": "x", "summary": "\x1b]52;c;\x07"}, {"z": ""}},
+		[]map[string]string{},
+		map[string]string{"version": "1"},
+	}
+	for _, v := range values {
+		var want bytes.Buffer
+		enc := json.NewEncoder(&want)
+		enc.SetEscapeHTML(false)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(v); err != nil {
+			t.Fatal(err)
+		}
+		var got bytes.Buffer
+		if code := emitLimited(&got, io.Discard, v, "test"); code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		if got.String() != string(escapeJSON(want.Bytes())) {
+			t.Fatalf("got\n%s\nwant\n%s", got.String(), escapeJSON(want.Bytes()))
+		}
+	}
+}
+
+// Round 6: the 8 MiB limit is enforced on the encoded bytes.
+func TestOutputLimitIsExact(t *testing.T) {
+	t.Run("a 9 MiB media type is cut to 1 KB", func(t *testing.T) {
+		mt := "application/" + strings.Repeat("x", 9<<20) + "+json"
+		spec, _ := json.Marshal(map[string]any{"openapi": "3.0.3", "paths": map[string]any{"/x": map[string]any{"post": map[string]any{
+			"operationId": "X", "requestBody": map[string]any{"content": map[string]any{mt: map[string]any{}}}}}}})
+		r := newEnv(t, specServer(t, string(spec)).URL).run(t, "help", "x")
+		want(t, r, 0)
+		got := decode[map[string]any](t, r.Stdout)["body_media_type"].(string)
+		if len(got) > maxTextBytes || !strings.HasSuffix(got, "…") || len(r.Stdout) > 64<<10 {
+			t.Fatalf("media type of %d bytes in %d bytes of output", len(got), len(r.Stdout))
+		}
+	})
+
+	t.Run("U+2028 escapes to six bytes", func(t *testing.T) {
+		summary := strings.Repeat(" ", 400) // 1,200 bytes, cut to 1 KB, printed as about 2 KB
+		paths := map[string]any{"/p0": map[string]any{"get": map[string]any{"summary": summary}}}
+		for i := 1; i < 5000; i++ {
+			paths[fmt.Sprintf("/p%d", i)] = map[string]any{"$ref": "#/paths/~1p0"}
+		}
+		spec, _ := json.Marshal(map[string]any{"openapi": "3.0.3", "paths": paths})
+		r := newEnv(t, specServer(t, string(spec)).URL).run(t, "operations")
+		want(t, r, 1)
+		if r.Stdout != "" || !strings.Contains(r.Stderr, "the operation list would be larger than 8 MiB") {
+			t.Fatalf("stdout %d bytes, stderr %s", len(r.Stdout), r.Stderr)
+		}
+	})
+
+	t.Run("56,000 scalar query parameters", func(t *testing.T) {
+		if raceEnabled {
+			t.Skip("validating 56,000 parameters under the race detector takes minutes")
+		}
+		var params []any
+		for i := 0; i < 56000; i++ {
+			params = append(params, map[string]any{"name": fmt.Sprintf("q%d", i), "in": "query", "schema": map[string]any{"type": "string"}})
+		}
+		spec, _ := json.Marshal(map[string]any{"openapi": "3.0.3", "paths": map[string]any{"/w": map[string]any{"get": map[string]any{
+			"operationId": "W", "parameters": params}}}})
+		r := newEnv(t, specServer(t, string(spec)).URL).run(t, "help", "w")
+		want(t, r, 1)
+		if r.Stdout != "" || !strings.Contains(r.Stderr, "help for w would be larger than 8 MiB") {
+			t.Fatalf("stdout %d bytes, stderr %s", len(r.Stdout), r.Stderr)
+		}
+	})
 }

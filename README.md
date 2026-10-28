@@ -146,8 +146,9 @@ A description outside the subset, or a hostile one, may not work, but it cannot 
 loading and validating it must finish within 20 seconds, the CLI's own processing
 has a fixed step budget, and names and server URLs are capped. A description
 that makes the loader fail, even by crashing it, counts as invalid. In
-`operations` and `help`, each summary and description is cut at 1 KB, and output
-that would pass 8 MiB is refused before it is built. Anything the CLI cannot
+`operations` and `help`, each summary, description, operationId, path and media
+type is cut at 1 KB, and output is encoded under an 8 MiB limit: past it, nothing
+is printed and the command exits 1. Anything the CLI cannot
 handle is refused with a message that names it.
 
 ## Exit codes

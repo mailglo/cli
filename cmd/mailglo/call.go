@@ -137,7 +137,7 @@ func parseFlags(o *operation, args []string, stdin io.Reader) (map[int][]string,
 	case body != nil && o.Body == nil:
 		return nil, nil, fmt.Errorf("%s takes no request body", o.Name)
 	case body == nil && o.Body != nil && o.Body.Required:
-		return nil, nil, fmt.Errorf("%s needs a request body (%s): %s VALUE|@file|-", o.Name, o.Body.MediaType, bodyFlag(o))
+		return nil, nil, fmt.Errorf("%s needs a request body (%s): %s VALUE|@file|-", o.Name, short(o.Body.MediaType), bodyFlag(o))
 	}
 	return values, body, nil
 }
