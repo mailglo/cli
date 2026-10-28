@@ -1,0 +1,9 @@
+# Build output
+/mailglo
+/mailglo.exe
+/dist/
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store

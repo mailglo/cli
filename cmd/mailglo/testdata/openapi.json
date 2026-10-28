@@ -1,0 +1,56 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Fixture API", "version": "v1"},
+  "paths": {
+    "/domains": {
+      "get": {
+        "operationId": "ListDomains",
+        "summary": "List domains.",
+        "parameters": [
+          {"$ref": "#/components/parameters/Cursor"},
+          {"name": "status", "in": "query", "description": "Only domains in this state.", "schema": {"type": "string"}}
+        ]
+      },
+      "post": {
+        "operationId": "CreateDomain",
+        "summary": "Add a domain.",
+        "parameters": [
+          {"name": "Idempotency-Key", "in": "header", "description": "Makes a retry safe.", "schema": {"type": "string"}}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/NewDomain"}}}
+        }
+      }
+    },
+    "/domains/{domainId}": {
+      "parameters": [{"$ref": "#/components/parameters/DomainId"}],
+      "get": {"operationId": "GetDomain", "summary": "Show one domain."},
+      "delete": {"operationId": "DeleteDomain", "summary": "Remove a domain."}
+    },
+    "/domains/{domainId}/notes": {
+      "parameters": [{"$ref": "#/components/parameters/DomainId"}],
+      "post": {
+        "operationId": "AddNote",
+        "summary": "Add a note to a domain.",
+        "requestBody": {"$ref": "#/components/requestBodies/Text"}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Cursor": {"name": "cursor", "in": "query", "description": "Cursor for the next page.", "schema": {"type": "string"}},
+      "DomainId": {"name": "domainId", "in": "path", "required": true, "description": "Domain identifier.", "schema": {"type": "string"}}
+    },
+    "requestBodies": {
+      "Text": {
+        "required": true,
+        "content": {"application/json": {"schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}}}
+      }
+    },
+    "schemas": {
+      "Named": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}},
+      "NewDomain": {"allOf": [{"$ref": "#/components/schemas/Named"}, {"type": "object", "properties": {"policy": {"type": "string"}}}]}
+    }
+  }
+}
