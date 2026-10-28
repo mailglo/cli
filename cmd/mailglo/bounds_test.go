@@ -160,14 +160,17 @@ func TestCacheStoresDescriptionVerbatim(t *testing.T) {
 	srv := specServer(t, spec)
 	e := newEnv(t, srv.URL)
 	want(t, e.run(t, "operations"), 0)
-	fi, err := os.Stat(cacheFileIn(t, e.cache, srv.URL))
-	if err != nil || fi.Size() > int64(len(spec))+4096 {
-		t.Fatalf("cache entry is %d bytes for a %d-byte description (%v)", fi.Size(), len(spec), err)
+	entry, err := os.ReadFile(cacheFileIn(t, e.cache, srv.URL))
+	if err != nil || len(entry) > len(spec)+4096 {
+		t.Fatalf("cache entry is %d bytes for a %d-byte description (%v)", len(entry), len(spec), err)
+	}
+	if _, cached, _ := strings.Cut(string(entry), "\n"); cached != string(completeSpec([]byte(spec))) {
+		t.Fatal("the cache does not hold the description as served")
 	}
 	srv.set(func() { srv.specStatus = http.StatusServiceUnavailable })
 	r := e.run(t, "help", "x")
 	want(t, r, 0)
-	if decode[map[string]any](t, r.Stdout)["summary"] != summary {
+	if decode[map[string]any](t, r.Stdout)["summary"] != capText(summary) {
 		t.Fatal("the cached description differs")
 	}
 	if maxCacheBytes < maxSpecBytes+maxMetaBytes {

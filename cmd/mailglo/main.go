@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"unicode/utf8"
 )
 
 // Set at build time with -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
@@ -135,11 +136,15 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	switch args[0] {
 	case "operations":
+		out := &outputBudget{left: maxOutputBytes}
 		list := []map[string]string{}
 		for _, o := range a.Ops {
-			m := map[string]string{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path, "summary": o.Summary}
+			m := map[string]string{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path, "summary": capText(o.Summary)}
 			if o.Unsupported != "" {
 				m["unsupported"] = o.Unsupported
+			}
+			if !out.add(m) {
+				return fail(stderr, exitError, out.refusal("the operation list"))
 			}
 			list = append(list, m)
 		}
@@ -149,7 +154,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, exitUsage, err.Error())
 		}
-		return emit(stdout, stderr, helpInfo(o))
+		info, ok := helpInfo(o)
+		if !ok {
+			return fail(stderr, exitError, (&outputBudget{}).refusal("help for "+o.Name))
+		}
+		return emit(stdout, stderr, info)
 	}
 
 	o, err := a.lookup(args[0])
@@ -159,18 +168,27 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return call(base, docURL, o, args[1:], token, stdin, stdout, stderr)
 }
 
-func helpInfo(o *operation) map[string]any {
+// helpInfo builds the help for o, or reports false when it would pass the
+// output budget.
+func helpInfo(o *operation) (map[string]any, bool) {
+	out := &outputBudget{left: maxOutputBytes}
 	params := []map[string]any{}
 	for i, p := range o.Params {
 		m := map[string]any{"flag": paramFlag(o, i), "qualified_flag": "--" + p.In + "." + p.Name, "in": p.In,
-			"required": p.Required, "description": p.Description}
+			"required": p.Required, "description": capText(p.Description)}
+		if !out.add(m) {
+			return nil, false
+		}
 		if p.Array {
 			m["repeatable"] = true
 		}
 		params = append(params, m)
 	}
 	info := map[string]any{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path,
-		"summary": o.Summary, "parameters": params}
+		"summary": capText(o.Summary), "parameters": params}
+	if !out.add(info) {
+		return nil, false
+	}
 	if o.Unsupported != "" {
 		info["unsupported"] = o.Unsupported
 	}
@@ -179,11 +197,86 @@ func helpInfo(o *operation) map[string]any {
 		info["body_needed"] = b.Required
 		info["body_media_type"] = b.MediaType
 		if b.JSON {
+			for _, f := range [][]string{b.Fields, b.RequiredFields} {
+				for _, name := range f {
+					if !out.addString(name) {
+						return nil, false
+					}
+				}
+			}
 			info["body_fields"] = b.Fields
 			info["body_required"] = b.RequiredFields
 		}
 	}
-	return info
+	return info, true
+}
+
+const (
+	// maxTextBytes caps each summary and description in the output.
+	maxTextBytes = 1024
+	// maxOutputBytes caps what operations and help print in total.
+	maxOutputBytes = 8 << 20
+)
+
+// capText shortens description text to maxTextBytes, ending in "…".
+func capText(s string) string {
+	if len(s) <= maxTextBytes {
+		return s
+	}
+	cut := maxTextBytes - len("…")
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// outputBudget estimates the encoded size of the output as it is built, so
+// an oversized result is refused before anything is encoded.
+type outputBudget struct{ left int }
+
+func (b *outputBudget) addString(s string) bool {
+	b.left -= jsonLen(s) + 8 // quotes, comma, indentation
+	return b.left >= 0
+}
+
+func (b *outputBudget) add(m any) bool {
+	switch m := m.(type) {
+	case map[string]string:
+		for k, v := range m {
+			b.addString(k)
+			b.addString(v)
+		}
+	case map[string]any:
+		for k, v := range m {
+			b.addString(k)
+			if s, ok := v.(string); ok {
+				b.addString(s)
+			} else {
+				b.left -= 8
+			}
+		}
+	}
+	return b.left >= 0
+}
+
+func (b *outputBudget) refusal(what string) string {
+	return fmt.Sprintf("%s would be larger than %d MiB; the API description is too large to print", what, maxOutputBytes>>20)
+}
+
+// jsonLen is the length of s as escaped JSON string content.
+func jsonLen(s string) int {
+	n := 0
+	for _, r := range s {
+		switch {
+		case r == '"' || r == '\\':
+			n += 2
+		case isControl(r) || r == utf8.RuneError:
+			n += 6
+		default:
+			n += utf8.RuneLen(r)
+		}
+	}
+	return n
 }
 
 // buildInfo reports the version stamped at release, or the module version

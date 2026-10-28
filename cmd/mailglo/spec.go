@@ -172,6 +172,13 @@ func load(raw []byte, timeout time.Duration) (*openapi3.T, error) {
 	defer cancel()
 	done := make(chan result, 1)
 	go func() {
+		// A malformed document can make the loader panic; that is an
+		// invalid description like any other, not a crash.
+		defer func() {
+			if p := recover(); p != nil {
+				done <- result{nil, fmt.Errorf("the loader failed on it (%v)", p)}
+			}
+		}()
 		loader := openapi3.NewLoader()
 		loader.IsExternalRefsAllowed = false
 		loader.Context = ctx

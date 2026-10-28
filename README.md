@@ -144,8 +144,11 @@ never through a proxy.
 A description outside the subset, or a hostile one, may not work, but it cannot make
 `mailglo` misbehave. Work and memory are bounded: the description is at most 16 MiB,
 loading and validating it must finish within 20 seconds, the CLI's own processing
-has a fixed step budget, and names and server URLs are capped. Anything the CLI
-cannot handle is refused with a message that names it.
+has a fixed step budget, and names and server URLs are capped. A description
+that makes the loader fail, even by crashing it, counts as invalid. In
+`operations` and `help`, each summary and description is cut at 1 KB, and output
+that would pass 8 MiB is refused before it is built. Anything the CLI cannot
+handle is refused with a message that names it.
 
 ## Exit codes
 
