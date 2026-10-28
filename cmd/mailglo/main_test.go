@@ -149,6 +149,7 @@ type env struct {
 	vars   map[string]string
 	stdin  string
 	stdout *os.File // when set, the CLI writes its standard output here
+	stderr *os.File // when set, the CLI writes its standard error here
 }
 
 func newEnv(t *testing.T, server string) *env {
@@ -181,6 +182,9 @@ func (e *env) runBinary(t *testing.T, bin string, args ...string) result {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if e.stdout != nil {
 		cmd.Stdout = e.stdout
+	}
+	if e.stderr != nil {
+		cmd.Stderr = e.stderr
 	}
 	err := cmd.Run()
 	if ctx.Err() != nil {

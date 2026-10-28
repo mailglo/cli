@@ -60,7 +60,31 @@ const (
 
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
+// run runs the CLI. Diagnostics carry results too (a partial list, a stale
+// cache), so a failed write to stderr makes a successful command exit 1.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	errOut := &trackedWriter{w: stderr}
+	code := runCommand(args, stdin, stdout, errOut)
+	if errOut.failed && code == exitOK {
+		code = exitError
+	}
+	return code
+}
+
+type trackedWriter struct {
+	w      io.Writer
+	failed bool
+}
+
+func (t *trackedWriter) Write(b []byte) (int, error) {
+	n, err := t.w.Write(b)
+	if err != nil {
+		t.failed = true
+	}
+	return n, err
+}
+
+func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	server := os.Getenv("MAILGLO_URL")
 	for len(args) > 0 {
 		a := args[0]
@@ -104,7 +128,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if token != "" && args[0] != "operations" && args[0] != "help" && !safeForToken(base) {
 		return fail(stderr, exitUsage, fmt.Sprintf("refusing to send MAILGLO_TOKEN to %s: use an https URL (plain http is allowed only for localhost)", base.Redacted()))
 	}
-	raw, code := loadSpec(base, stderr)
+	raw, docURL, code := loadSpec(base, stderr)
 	if code != exitOK {
 		return code
 	}
@@ -117,7 +141,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "operations":
 		list := []map[string]string{}
 		for _, o := range a.Ops {
-			list = append(list, map[string]string{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path, "summary": o.Summary})
+			m := map[string]string{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path, "summary": o.Summary}
+			if o.Unsupported != "" {
+				m["unsupported"] = o.Unsupported
+			}
+			list = append(list, m)
 		}
 		return emit(stdout, stderr, list)
 	case "help":
@@ -132,13 +160,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, exitUsage, err.Error())
 	}
-	return call(base, a, o, args[1:], token, stdin, stdout, stderr)
+	return call(base, docURL, o, args[1:], token, stdin, stdout, stderr)
 }
 
 func helpInfo(o *operation) map[string]any {
 	params := []map[string]any{}
-	for _, p := range o.Params {
-		m := map[string]any{"flag": paramFlag(o, p), "qualified_flag": "--" + p.In + "." + p.Name, "in": p.In,
+	for i, p := range o.Params {
+		m := map[string]any{"flag": paramFlag(o, i), "qualified_flag": "--" + p.In + "." + p.Name, "in": p.In,
 			"required": p.Required, "description": p.Description}
 		if p.Array {
 			m["repeatable"] = true
@@ -147,15 +175,16 @@ func helpInfo(o *operation) map[string]any {
 	}
 	info := map[string]any{"operation": o.Name, "operation_id": o.ID, "method": o.Method, "path": o.Path,
 		"summary": o.Summary, "parameters": params}
+	if o.Unsupported != "" {
+		info["unsupported"] = o.Unsupported
+	}
 	if b := o.Body; b != nil {
 		info["body_flag"] = bodyFlag(o)
 		info["body_needed"] = b.Required
-		if b.MediaType != "" {
-			info["body_media_type"] = b.MediaType
+		info["body_media_type"] = b.MediaType
+		if b.JSON {
 			info["body_fields"] = b.Fields
 			info["body_required"] = b.RequiredFields
-		} else {
-			info["body_media_types_unsupported"] = b.Declared
 		}
 	}
 	return info

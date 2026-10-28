@@ -42,8 +42,8 @@ export MAILGLO_TOKEN=...
 ```
 
 Treat the token like a password. `mailglo` sends it only to the server you chose,
-over https or over plain http to `localhost`. It does not follow a redirect to
-another server with the token, and it never prints the token.
+over https or over plain http to `localhost`. No request follows a redirect to
+another server, and the token is never printed.
 
 | Variable        | Purpose                                                         |
 | --------------- | --------------------------------------------------------------- |
@@ -88,6 +88,40 @@ echo '{"names":["example.org"]}' | mailglo add-domains --mspId MSP_ID --clientId
 A successful response goes to standard output. An error response goes to standard
 error. When a list is cut into pages, `mailglo` says so on standard error and gives
 the `--cursor` value for the next page.
+
+## Supported API descriptions
+
+`mailglo` is built for the Mailglo API description, not for every OpenAPI document.
+It accepts this subset:
+
+- **Document**: OpenAPI 3.0 or 3.1, served as JSON, with a `paths` object.
+- **References**: local `$ref`s only (`#/...`), read as JSON Pointers with
+  percent-decoding, `~0`, `~1` and array indices.
+- **Paths**: absolute (`/...`), without `?`, `#`, spaces or backslashes. Every
+  `{variable}` has a path parameter and every path parameter is in the path.
+- **Servers**: the first `servers` entry of the operation, else of the path, else of
+  the document, with variables set to their defaults. A relative URL resolves against
+  the URL the description came from. Only its path is used: requests always go to
+  the server you selected. With no `servers`, the base path is `/api/v1`.
+- **Parameters**: scalar or array schemas.
+  - path: `simple`, `label` or `matrix`
+  - query: `form`; arrays also `spaceDelimited` or `pipeDelimited`
+  - header: `simple`
+  - cookie: `form`, single values only
+
+  Not supported: `content` instead of `schema`, object schemas, `deepObject`,
+  `allowReserved`, and other locations.
+- **Request bodies**: `application/json`, any `*/*+json` type, or
+  `application/octet-stream` (sent as raw bytes from `--body @file` or `-`).
+
+A document outside the subset is refused. An operation outside it still appears in
+`mailglo operations` and `mailglo help` with an `unsupported` field that names the
+construct, and running it exits with code 2.
+
+Command names are operationIds in kebab case. An operation without an operationId
+is named after its method and path, such as `get-health`. When names clash, or an
+operation would be named `help`, `operations` or `version`, the method is appended
+(`version-get`), then a number.
 
 ## Exit codes
 

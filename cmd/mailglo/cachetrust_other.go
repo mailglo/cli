@@ -9,22 +9,16 @@ import (
 	"os"
 )
 
-// secureDir makes sure dir is a real directory, creating it if needed. On
-// this platform the per-user cache location's access control lists keep
-// other users out.
-func secureDir(dir string) error {
-	fi, err := os.Lstat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		fi, err = os.Lstat(dir)
-	}
-	if err != nil {
-		return err
-	}
-	if fi.Mode()&(fs.ModeSymlink|fs.ModeIrregular) != 0 || !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory", dir)
+// noFollow is not available here; reads compare the opened file with an
+// Lstat of the entry instead.
+const noFollow = 0
+
+// verifyDir checks that the opened cache directory is a directory. On this
+// platform the per-user cache location's access control lists keep other
+// users out.
+func verifyDir(_ *os.File, fi fs.FileInfo, name string) error {
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", name)
 	}
 	return nil
 }

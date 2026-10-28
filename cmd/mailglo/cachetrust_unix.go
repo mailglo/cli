@@ -10,29 +10,24 @@ import (
 	"syscall"
 )
 
-// secureDir makes sure dir is a directory owned by this user that no one
-// else can write, creating it if needed. A directory that is ours but too
-// open is tightened to 0700.
-func secureDir(dir string) error {
-	fi, err := os.Lstat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		fi, err = os.Lstat(dir)
-	}
-	if err != nil {
-		return err
-	}
-	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory", dir)
+// noFollow keeps an open from following a link at the final path element.
+// os.Root may still resolve links that stay inside the directory, so reads
+// also compare the opened file with an Lstat of the entry.
+const noFollow = syscall.O_NOFOLLOW
+
+// verifyDir checks the opened cache directory: it must belong to this user,
+// and no one else may write to it. A directory that is ours but too open is
+// tightened to 0700 through the open handle.
+func verifyDir(d *os.File, fi fs.FileInfo, name string) error {
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", name)
 	}
 	if !ownedByMe(fi) {
-		return fmt.Errorf("%s belongs to another user", dir)
+		return fmt.Errorf("%s belongs to another user", name)
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return fmt.Errorf("%s is open to other users: %w", dir, err)
+		if err := d.Chmod(0o700); err != nil {
+			return fmt.Errorf("%s is open to other users: %w", name, err)
 		}
 	}
 	return nil

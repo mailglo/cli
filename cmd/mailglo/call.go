@@ -25,20 +25,22 @@ import (
 
 var locations = []string{"path", "query", "header", "cookie"}
 
-// paramFlag is the flag help shows for p: the bare name when it is
-// unambiguous, else the location-qualified one.
-func paramFlag(o *operation, p param) string {
-	if p.Name == "body" || p.Name == "request-body" || len(paramsNamed(o, p.Name)) > 1 {
-		return "--" + p.In + "." + p.Name
+// paramFlag is the flag help shows for the parameter at index i: the bare
+// name when it resolves to this parameter, else the location-qualified one,
+// which always does.
+func paramFlag(o *operation, i int) string {
+	p := o.Params[i]
+	if idx, err := resolveFlag(o, p.Name); err == nil && idx == i {
+		return "--" + p.Name
 	}
-	return "--" + p.Name
+	return "--" + p.In + "." + p.Name
 }
 
 func bodyFlag(o *operation) string {
-	if len(paramsNamed(o, "body")) > 0 {
-		return "--request-body"
+	if idx, err := resolveFlag(o, "body"); err == nil && idx == -1 {
+		return "--body"
 	}
-	return "--body"
+	return "--request-body"
 }
 
 func paramsNamed(o *operation, name string) []int {
@@ -52,6 +54,11 @@ func paramsNamed(o *operation, name string) []int {
 }
 
 // resolveFlag maps a flag name to a parameter index, or to the body (-1).
+// In order: --request-body; --body unless a parameter is called body;
+// --<in>.<name> for a parameter in that location; a parameter's bare name
+// when only one parameter has it. The qualified form wins over a parameter
+// whose bare name looks like one, and that parameter stays reachable as
+// --<in>.<its name>.
 func resolveFlag(o *operation, key string) (int, error) {
 	switch {
 	case key == "request-body":
@@ -127,34 +134,38 @@ func parseFlags(o *operation, args []string, stdin io.Reader) (map[int][]string,
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot read body: %w", err)
 		}
-		if !json.Valid(body) {
+		if body == nil {
+			body = []byte{}
+		}
+		if (o.Body == nil || o.Body.JSON) && !json.Valid(body) {
 			return nil, nil, fmt.Errorf("%s must be JSON", bodyFlag(o))
 		}
 	}
 	for i, p := range o.Params {
 		if p.Required && len(values[i]) == 0 {
-			return nil, nil, fmt.Errorf("missing required %s; run: mailglo help %s", paramFlag(o, p), o.Name)
+			return nil, nil, fmt.Errorf("missing required %s; run: mailglo help %s", paramFlag(o, i), o.Name)
 		}
 	}
 	switch {
 	case body != nil && o.Body == nil:
 		return nil, nil, fmt.Errorf("%s takes no request body", o.Name)
-	case body != nil && o.Body.MediaType == "":
-		return nil, nil, fmt.Errorf("%s takes a body as %s, which this CLI cannot send", o.Name, strings.Join(o.Body.Declared, " or "))
 	case body == nil && o.Body != nil && o.Body.Required:
-		return nil, nil, fmt.Errorf("%s needs a request body: %s JSON|@file|-", o.Name, bodyFlag(o))
+		return nil, nil, fmt.Errorf("%s needs a request body (%s): %s VALUE|@file|-", o.Name, o.Body.MediaType, bodyFlag(o))
 	}
 	return values, body, nil
 }
 
-// apiBase is the URL operation paths are appended to. The description's
-// first server URL is resolved against the description's own URL, but only
-// its path is used: requests, and the token, stay on the selected server's
-// origin. Without "servers" the base is <server>/api/v1.
-func apiBase(base *url.URL, a *api) string {
-	if a.ServerURL != "" {
-		doc, err1 := url.Parse(base.String() + "/api/openapi.json")
-		ref, err2 := url.Parse(a.ServerURL)
+// apiBase is the URL operation paths are appended to. The operation's
+// server URL is resolved against the URL the description came from, but
+// only its path is used: requests stay on the selected server's origin.
+// Without a server URL the base is <server>/api/v1.
+func apiBase(base *url.URL, docURL string, o *operation) string {
+	if o.ServerURL != "" {
+		doc, err1 := url.Parse(docURL)
+		if docURL == "" || err1 != nil {
+			doc, err1 = url.Parse(base.String() + "/api/openapi.json")
+		}
+		ref, err2 := url.Parse(o.ServerURL)
 		if err1 == nil && err2 == nil {
 			u := doc.ResolveReference(ref)
 			return base.Scheme + "://" + base.Host + strings.TrimRight(u.EscapedPath(), "/")
@@ -190,7 +201,7 @@ func buildRequest(o *operation, target string, values map[int][]string) (string,
 				}
 				parts = append(parts, url.PathEscape(v))
 			}
-			path = strings.ReplaceAll(path, "{"+p.Name+"}", strings.Join(parts, ","))
+			path = strings.ReplaceAll(path, "{"+p.Name+"}", pathValue(p, parts))
 		case "query":
 			name := url.QueryEscape(p.Name)
 			var esc []string
@@ -240,15 +251,43 @@ func buildRequest(o *operation, target string, values map[int][]string) (string,
 	return target, headers, nil
 }
 
+// pathValue serializes escaped path values by style (simple, label or
+// matrix) and explode.
+func pathValue(p param, parts []string) string {
+	sep := ","
+	switch p.Style {
+	case "label":
+		if p.Explode {
+			sep = "."
+		}
+		return "." + strings.Join(parts, sep)
+	case "matrix":
+		name := ";" + url.PathEscape(p.Name) + "="
+		if p.Explode {
+			return name + strings.Join(parts, name)
+		}
+		return name + strings.Join(parts, ",")
+	}
+	return strings.Join(parts, sep)
+}
+
 // call maps flags onto one operation, sends it and prints the response.
-func call(base *url.URL, a *api, o *operation, args []string, token string, stdin io.Reader, stdout, stderr io.Writer) int {
+func call(base *url.URL, docURL string, o *operation, args []string, token string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if o.Unsupported != "" {
+		return fail(stderr, exitUsage, fmt.Sprintf("this CLI cannot call %s: %s", o.Name, o.Unsupported))
+	}
 	values, body, err := parseFlags(o, args, stdin)
 	if err != nil {
 		return fail(stderr, exitUsage, err.Error())
 	}
-	target, headers, err := buildRequest(o, apiBase(base, a), values)
+	target, headers, err := buildRequest(o, apiBase(base, docURL, o), values)
 	if err != nil {
 		return fail(stderr, exitUsage, err.Error())
+	}
+	// The request must go to the selected server, whatever the description
+	// says.
+	if u, err := url.Parse(target); err != nil || u.User != nil || !sameOrigin(u, base) {
+		return fail(stderr, exitError, "refusing a request outside "+origin(base)+": "+target)
 	}
 	req, err := http.NewRequest(o.Method, target, bytes.NewReader(body))
 	if err != nil {
@@ -263,15 +302,9 @@ func call(base *url.URL, a *api, o *operation, args []string, token string, stdi
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("too many redirects")
-		}
-		if token != "" && !sameOrigin(r.URL, via[0].URL) {
-			return fmt.Errorf("refusing to follow a redirect to another origin (%s) with MAILGLO_TOKEN", origin(r.URL))
-		}
-		return nil
-	}}
+	// Requests can carry the token, cookies and other credential headers,
+	// so no redirect may leave the server's origin.
+	client := &http.Client{Timeout: 60 * time.Second, CheckRedirect: sameOriginRedirects}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fail(stderr, exitRetry, "request failed: "+err.Error())

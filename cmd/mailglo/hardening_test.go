@@ -102,11 +102,13 @@ func TestTokenStaysOnOrigin(t *testing.T) {
 		t.Fatalf("call: %+v", c)
 	}
 
-	// Without a token, a cross-origin redirect is followed.
+	// Without a token the request can still carry credentials (a cookie
+	// or header parameter), so a cross-origin redirect is refused too.
 	srv.set(func() { redirectTo = other.URL + "/api/v1/domains/x" })
-	want(t, newEnv(t, srv.URL).run(t, "get-domain", "--domainId", "d"), 0)
-	if c := other.lastCall(t); c.Auth != "" {
-		t.Fatalf("auth %q", c.Auth)
+	r = newEnv(t, srv.URL).run(t, "get-domain", "--domainId", "d")
+	want(t, r, 6)
+	if other.callCount() != 0 || !strings.Contains(r.Stderr, "redirect to another origin") {
+		t.Fatalf("followed a cross-origin redirect without a token: %s", r.Stderr)
 	}
 }
 
@@ -484,7 +486,6 @@ func TestArrayParameters(t *testing.T) {
 		{"name":"ids","in":"query","explode":false,"schema":{"type":"array"}},
 		{"name":"pipes","in":"query","style":"pipeDelimited","explode":false,"schema":{"type":"array"}},
 		{"name":"single","in":"query","schema":{"type":"string"}},
-		{"name":"deep","in":"query","style":"deepObject","schema":{"type":"array"}},
 		{"name":"X-Ids","in":"header","schema":{"type":"array"}}]}}}}`
 	srv := specServer(t, spec)
 	e := newEnv(t, srv.URL)
@@ -495,7 +496,6 @@ func TestArrayParameters(t *testing.T) {
 		t.Fatalf("query %s", c.RawQuery)
 	}
 	want(t, e.run(t, "search", "--single", "a", "--single", "b"), 2)
-	want(t, e.run(t, "search", "--deep", "a"), 2)
 	if r := e.run(t, "help", "search"); !strings.Contains(r.Stdout, `"repeatable": true`) {
 		t.Fatalf("help %s", r.Stdout)
 	}
@@ -556,7 +556,7 @@ func TestJSONMediaTypes(t *testing.T) {
 		t.Fatal("a refused body reached the server")
 	}
 	r = e.run(t, "help", "upload-item")
-	if !strings.Contains(r.Stdout, `"multipart/form-data"`) {
+	if !strings.Contains(decode[map[string]any](t, r.Stdout)["unsupported"].(string), "[multipart/form-data] are not supported") {
 		t.Fatalf("help %s", r.Stdout)
 	}
 }

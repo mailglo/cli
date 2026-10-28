@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,7 +25,10 @@ import (
 const maxSpecBytes = 64 << 20
 
 type cachedSpec struct {
-	Server       string          `json:"server"`
+	Server string `json:"server"`
+	// URL is where the description was finally fetched from, after
+	// same-origin redirects; relative server URLs resolve against it.
+	URL          string          `json:"url"`
 	ETag         string          `json:"etag,omitempty"`
 	LastModified string          `json:"last_modified,omitempty"`
 	FetchedAt    time.Time       `json:"fetched_at"`
@@ -40,95 +44,162 @@ func parseServer(s string) (*url.URL, error) {
 	return u, nil
 }
 
-// cacheFile returns the cache file for server, or "" when there is no cache
-// directory this user alone controls.
-func cacheFile(server string, stderr io.Writer) string {
-	root, err := os.UserCacheDir()
+// specCache is the cache directory, opened once and verified through the
+// open handle; every file operation is relative to that handle.
+type specCache struct {
+	root *os.Root
+	name string
+}
+
+// openCache opens the cache for server, or returns nil when there is no
+// cache directory this user alone controls.
+func openCache(server string, stderr io.Writer) *specCache {
+	base, err := os.UserCacheDir()
 	if err != nil {
-		return ""
+		return nil
 	}
-	dir := filepath.Join(root, "mailglo")
-	if err := secureDir(dir); err != nil {
+	dir := filepath.Join(base, "mailglo")
+	refuse := func(err error) *specCache {
 		warn(stderr, "warning: not using the cache: "+err.Error())
-		return ""
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return refuse(err)
+	}
+	before, err := os.Lstat(dir)
+	if err != nil {
+		return refuse(err)
+	}
+	if !before.IsDir() { // includes a symbolic link
+		return refuse(fmt.Errorf("%s is not a directory", dir))
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return refuse(err)
+	}
+	d, err := root.Open(".")
+	if err == nil {
+		var fi os.FileInfo
+		if fi, err = d.Stat(); err == nil {
+			switch {
+			case !os.SameFile(before, fi):
+				err = fmt.Errorf("%s changed while it was opened", dir)
+			default:
+				err = verifyDir(d, fi, dir)
+			}
+		}
+		_ = d.Close()
+	}
+	if err != nil {
+		_ = root.Close()
+		return refuse(err)
 	}
 	sum := sha256.Sum256([]byte(server))
-	return filepath.Join(dir, "spec-"+hex.EncodeToString(sum[:8])+".json")
+	return &specCache{root: root, name: "spec-" + hex.EncodeToString(sum[:8]) + ".json"}
 }
 
-func readCache(path, server string, stderr io.Writer) *cachedSpec {
-	if path == "" {
+func (c *specCache) close() {
+	if c != nil {
+		_ = c.root.Close()
+	}
+}
+
+// read returns the cached description for server. The entry must not be a
+// link, and the opened file must be the same regular file, owned by this
+// user and not writable by others.
+func (c *specCache) read(server string, stderr io.Writer) *cachedSpec {
+	if c == nil {
 		return nil
 	}
-	fi, err := os.Lstat(path)
+	ignore := func(err error) *cachedSpec {
+		warn(stderr, fmt.Sprintf("warning: ignoring the cached API description %s: %v", c.name, err))
+		return nil
+	}
+	entry, err := c.root.Lstat(c.name)
 	if err != nil {
 		return nil
+	}
+	if err := trustedFile(entry); err != nil {
+		return ignore(err)
+	}
+	f, err := c.root.OpenFile(c.name, os.O_RDONLY|noFollow, 0)
+	if err != nil {
+		return ignore(err)
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return ignore(err)
+	}
+	if !os.SameFile(entry, fi) {
+		return ignore(errors.New("the file changed while it was opened"))
 	}
 	if err := trustedFile(fi); err != nil {
-		warn(stderr, fmt.Sprintf("warning: ignoring the cached API description %s: %v", path, err))
-		return nil
+		return ignore(err)
 	}
-	b, err := os.ReadFile(path)
+	b, err := io.ReadAll(io.LimitReader(f, 2*maxSpecBytes))
 	if err != nil {
+		return ignore(err)
+	}
+	var cs cachedSpec
+	if json.Unmarshal(b, &cs) != nil || cs.Server != server || validSpec(cs.Spec) != nil {
 		return nil
 	}
-	var c cachedSpec
-	if json.Unmarshal(b, &c) != nil || c.Server != server || validSpec(c.Spec) != nil {
+	if u, err := url.Parse(cs.URL); err != nil || !sameOrigin(u, mustParse(server)) {
 		return nil
 	}
-	return &c
+	return &cs
 }
 
-func writeCache(path string, c *cachedSpec) error {
-	b, err := json.Marshal(c)
+func (c *specCache) write(cs *cachedSpec) error {
+	b, err := json.Marshal(cs)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".spec-*")
+	tmp := ".spec-" + rand.Text()
+	f, err := c.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|noFollow, 0o600)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if _, err := tmp.Write(b); err != nil {
-		_ = tmp.Close()
+	defer func() { _ = c.root.Remove(tmp) }()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return c.root.Rename(tmp, c.name)
 }
 
-// loadSpec returns the server's API description, or an exit code when there
-// is none to use.
-func loadSpec(base *url.URL, stderr io.Writer) ([]byte, int) {
+// loadSpec returns the server's API description and the URL it came from,
+// or an exit code when there is none to use.
+func loadSpec(base *url.URL, stderr io.Writer) ([]byte, string, int) {
 	server := base.String()
-	path := cacheFile(server, stderr)
-	cached := readCache(path, server, stderr)
+	cache := openCache(server, stderr)
+	defer cache.close()
+	cached := cache.read(server, stderr)
 
 	fresh, err := fetchSpec(server, cached)
-	if err == nil && fresh == nil {
-		return cached.Spec, exitOK // 304 Not Modified
-	}
 	if err == nil {
-		if path != "" {
-			if werr := writeCache(path, fresh); werr != nil {
+		if fresh != cached && cache != nil {
+			if werr := cache.write(fresh); werr != nil {
 				warn(stderr, "warning: cannot cache the API description: "+werr.Error())
 			}
 		}
-		return fresh.Spec, exitOK
+		return fresh.Spec, fresh.URL, exitOK
 	}
 	if cached != nil {
 		warn(stderr, fmt.Sprintf("warning: cannot fetch the API description from %s (%v); using the copy cached %s",
 			server, err, cached.FetchedAt.Local().Format(time.RFC3339)))
-		return cached.Spec, exitOK
+		return cached.Spec, cached.URL, exitOK
 	}
 	warn(stderr, fmt.Sprintf("cannot fetch the API description from %s: %v; retry later", server, err))
-	return nil, exitRetry
+	return nil, "", exitRetry
 }
 
-// fetchSpec downloads the description. It returns nil, nil when the cached
-// copy is still current. It never sends the API token, and it follows
+// fetchSpec downloads the description, or returns cached when the server
+// says it is still current. It never sends the API token, and it follows
 // redirects only within the server's origin, so a redirect cannot swap in a
 // description from elsewhere or downgrade https to http.
 func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
@@ -152,9 +223,15 @@ func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	final := resp.Request.URL.String()
 	switch {
 	case resp.StatusCode == http.StatusNotModified && cached != nil:
-		return nil, nil
+		if cached.URL == final {
+			return cached, nil
+		}
+		moved := *cached
+		moved.URL = final
+		return &moved, nil
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
@@ -168,7 +245,7 @@ func fetchSpec(server string, cached *cachedSpec) (*cachedSpec, error) {
 	if err := validSpec(b); err != nil {
 		return nil, err
 	}
-	return &cachedSpec{Server: server, ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified"),
+	return &cachedSpec{Server: server, URL: final, ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified"),
 		FetchedAt: time.Now().UTC(), Spec: b}, nil
 }
 
@@ -203,6 +280,14 @@ func origin(u *url.URL) string {
 		host = "[" + host + "]"
 	}
 	return scheme + "://" + host + ":" + port
+}
+
+func mustParse(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		return &url.URL{}
+	}
+	return u
 }
 
 func userAgent() string {
