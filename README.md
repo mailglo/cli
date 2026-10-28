@@ -42,8 +42,9 @@ export MAILGLO_TOKEN=...
 ```
 
 Treat the token like a password. `mailglo` sends it only to the server you chose,
-over https or over plain http to `localhost`. No request follows a redirect to
-another server, and the token is never printed.
+over https, or over plain http to `localhost` or a literal loopback address such as
+`127.0.0.1`. Plain http to this machine connects directly, never through a proxy.
+No request follows a redirect to another server, and the token is never printed.
 
 | Variable        | Purpose                                                         |
 | --------------- | --------------------------------------------------------------- |
@@ -96,23 +97,41 @@ It accepts this subset:
 
 - **Document**: OpenAPI 3.0 or 3.1, served as JSON, with a `paths` object.
 - **References**: local `$ref`s only (`#/...`), read as JSON Pointers with
-  percent-decoding, `~0`, `~1` and array indices.
+  percent-decoding, `~0`, `~1` and array indices (`0` or `[1-9][0-9]*`). Beside
+  `$ref`, only `summary` and `description` are allowed.
 - **Paths**: absolute (`/...`), without `?`, `#`, spaces or backslashes. Every
   `{variable}` has a path parameter and every path parameter is in the path.
 - **Servers**: the first `servers` entry of the operation, else of the path, else of
-  the document, with variables set to their defaults. A relative URL resolves against
+  the document. Each `{variable}` is replaced once by its default, and the result
+  must be at most 2048 bytes. A relative URL resolves against
   the URL the description came from. Only its path is used: requests always go to
   the server you selected. With no `servers`, the base path is `/api/v1`.
-- **Parameters**: scalar or array schemas.
+- **Parameters**: scalar or array schemas, each declared once per list, with no `=`
+  in the name.
   - path: `simple`, `label` or `matrix`
   - query: `form`; arrays also `spaceDelimited` or `pipeDelimited`
   - header: `simple`
   - cookie: `form`, single values only
 
-  Not supported: `content` instead of `schema`, object schemas, `deepObject`,
-  `allowReserved`, and other locations.
+  Not supported: `content` instead of `schema`, object schemas, `allOf`, `oneOf`,
+  `anyOf` or `not` in a parameter schema, `deepObject`, `allowReserved`, other
+  locations, and header parameters the CLI or HTTP sets itself (`Accept`,
+  `Authorization`, `Content-Type`, `Cookie`, `Host`, `User-Agent` and other
+  connection headers).
 - **Request bodies**: `application/json`, any `*/*+json` type, or
   `application/octet-stream` (sent as raw bytes from `--body @file` or `-`).
+
+### Threat model
+
+The API description comes from the server you chose, over https or from your own
+machine, so `mailglo` trusts it to describe that server's API. It does not trust it
+with anything else: requests, the token and redirects stay on the selected server's
+origin, and text from the description is escaped before it reaches your terminal.
+
+A description outside the subset, or a hostile one, may not work, but it cannot make
+`mailglo` misbehave. Work and memory are bounded: the description is at most 64 MiB,
+parsing has a fixed step budget, and server URLs are capped. Anything the CLI cannot
+handle is refused with a message that names it.
 
 A document outside the subset is refused. An operation outside it still appears in
 `mailglo operations` and `mailglo help` with an `unsupported` field that names the

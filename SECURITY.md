@@ -16,3 +16,22 @@ Security fixes go into the latest release. Upgrade to it before you report.
 
 This repository covers the `mailglo` command-line client. Report issues in the
 Mailglo service itself to the same address.
+
+## Threat model
+
+`mailglo` reads its commands from the API description of the server you select,
+over https or from this machine. It trusts that description to describe the
+server's API, and nothing more:
+
+- Requests, the API token and redirects stay on the selected server's scheme, host
+  and port. The token is sent over plain http only to `localhost` or a literal
+  loopback address, directly and never through a proxy.
+- Text from the description and from responses is escaped before it reaches the
+  terminal.
+- The cached description is used only when the cache directory and file belong to
+  you and no one else can write to them.
+- A description outside the supported subset (see README.md), or a hostile one,
+  must not cause unbounded memory or CPU use, and must be refused rather than
+  misinterpreted. Supporting it is not a goal.
+
+Reports that break these properties are in scope.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -29,6 +30,20 @@ type operation struct {
 	Params                []param
 	Body                  *body
 	Unsupported           string // why the CLI cannot call this operation, or ""
+
+	byName map[string][]int  // parameter indexes by name
+	byLoc  map[[2]string]int // parameter index by location and name
+}
+
+// index builds the flag lookup tables once, so resolving a flag costs the
+// same whatever the number of parameters.
+func (o *operation) index() {
+	o.byName = make(map[string][]int, len(o.Params))
+	o.byLoc = make(map[[2]string]int, len(o.Params))
+	for i, p := range o.Params {
+		o.byName[p.Name] = append(o.byName[p.Name], i)
+		o.byLoc[[2]string{p.In, p.Name}] = i
+	}
 }
 
 type param struct {
@@ -102,6 +117,8 @@ func parseSpec(raw []byte) (*api, error) {
 			o.ID, _ = op["operationId"].(string)
 			o.Summary, _ = op["summary"].(string)
 			o.Params = r.merge(shared, r.params(op["parameters"]))
+			o.index()
+			r.spend(2 * len(o.Params))
 			o.Body = r.body(op["requestBody"])
 			opServer, opServerErr := r.server(op["servers"])
 			err := pathErr
@@ -303,16 +320,13 @@ func (r *resolver) server(v any) (string, error) {
 		return "", errors.New("a server has no url")
 	}
 	vars, _ := s["variables"].(map[string]any)
-	for _, name := range sortedKeys(vars) {
-		r.spend(1)
-		if m, ok := vars[name].(map[string]any); ok {
-			if def, ok := m["default"].(string); ok {
-				u = strings.ReplaceAll(u, "{"+name+"}", def)
-			}
-		}
+	u, err := expandServer(u, vars)
+	r.spend(len(u))
+	if err != nil {
+		return "", err
 	}
-	if strings.ContainsAny(u, "{}") || hasControl(u) {
-		return "", fmt.Errorf("server URL %q has a variable without a default", u)
+	if hasControl(u) {
+		return "", fmt.Errorf("server URL %q has a control character", u)
 	}
 	if _, err := url.Parse(u); err != nil {
 		return "", fmt.Errorf("server URL %q is not a URL", u)
@@ -323,6 +337,54 @@ func (r *resolver) server(v any) (string, error) {
 	return u, nil
 }
 
+// maxServerURL caps a server URL after variable substitution.
+const maxServerURL = 2048
+
+// expandServer replaces each {name} in a server URL with the variable's
+// default, in one pass: a default is never expanded again.
+func expandServer(u string, vars map[string]any) (string, error) {
+	var b strings.Builder
+	rest := u
+	for {
+		i := strings.IndexAny(rest, "{}")
+		if i < 0 {
+			b.WriteString(rest)
+			break
+		}
+		j := strings.IndexByte(rest[i:], '}')
+		if rest[i] == '}' || j < 0 {
+			return "", fmt.Errorf("server URL %q has unbalanced braces", short(u))
+		}
+		name := rest[i+1 : i+j]
+		m, _ := vars[name].(map[string]any)
+		def, ok := m["default"].(string)
+		if !ok {
+			return "", fmt.Errorf("server URL %q has a variable without a default", short(u))
+		}
+		if strings.ContainsAny(def, "{}") {
+			return "", fmt.Errorf("server variable %q has braces in its default", short(name))
+		}
+		b.WriteString(rest[:i])
+		b.WriteString(def)
+		if b.Len() > maxServerURL {
+			return "", fmt.Errorf("server URL %q is longer than %d bytes after substitution", short(u), maxServerURL)
+		}
+		rest = rest[i+j+1:]
+	}
+	if b.Len() > maxServerURL {
+		return "", fmt.Errorf("server URL is longer than %d bytes", maxServerURL)
+	}
+	return b.String(), nil
+}
+
+// short trims text from the description for a diagnostic.
+func short(s string) string {
+	if len(s) <= 80 {
+		return s
+	}
+	return s[:77] + "..."
+}
+
 // merge lets operation parameters override path-level ones with the same
 // name and location.
 func (r *resolver) merge(shared, own []param) []param {
@@ -330,12 +392,7 @@ func (r *resolver) merge(shared, own []param) []param {
 	seen := make(map[[2]string]bool, len(own))
 	out := make([]param, 0, len(own)+len(shared))
 	for _, p := range own {
-		key := [2]string{p.In, p.Name}
-		if seen[key] {
-			r.fail(fmt.Errorf("parameter %q in %s is declared twice", p.Name, p.In))
-			continue
-		}
-		seen[key] = true
+		seen[[2]string{p.In, p.Name}] = true
 		out = append(out, p)
 	}
 	for _, s := range shared {
@@ -387,6 +444,15 @@ func (r *resolver) object(v any) map[string]any {
 		if !ok {
 			return m
 		}
+		// A Reference Object may carry only a summary and a description.
+		// Anything else beside $ref (allowed for schemas in OpenAPI 3.1)
+		// would have to be merged, which this CLI does not do.
+		for k := range m {
+			if k != "$ref" && k != "summary" && k != "description" {
+				r.fail(fmt.Errorf("reference %q has sibling %q; $ref with other keys is not supported", ref, k))
+				return nil
+			}
+		}
 		target, err := r.pointer(ref)
 		if err != nil {
 			r.fail(err)
@@ -432,8 +498,11 @@ func (r *resolver) pointer(ref string) (any, error) {
 			}
 			cur = next
 		case []any:
+			if !arrayIndex(tok) {
+				return nil, fmt.Errorf("reference %q has an invalid array index %q", ref, tok)
+			}
 			i, err := strconv.Atoi(tok)
-			if err != nil || i < 0 || i >= len(c) || tok[0] == '+' || (len(tok) > 1 && tok[0] == '0') {
+			if err != nil || i >= len(c) {
 				return nil, fmt.Errorf("reference %q does not resolve", ref)
 			}
 			cur = c[i]
@@ -442,6 +511,31 @@ func (r *resolver) pointer(ref string) (any, error) {
 		}
 	}
 	return cur, nil
+}
+
+// arrayIndex reports whether tok is a JSON Pointer array index:
+// 0|[1-9][0-9]*.
+func arrayIndex(tok string) bool {
+	if tok == "0" {
+		return true
+	}
+	if tok == "" || tok[0] < '1' || tok[0] > '9' || len(tok) > 9 {
+		return false
+	}
+	for _, c := range []byte(tok) {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// reservedHeaders are set by the CLI or by HTTP itself; a header parameter
+// with one of these names could not be sent as given.
+var reservedHeaders = map[string]bool{
+	"Accept": true, "Accept-Encoding": true, "Authorization": true, "Connection": true, "Content-Length": true,
+	"Content-Type": true, "Cookie": true, "Expect": true, "Host": true, "Keep-Alive": true, "Proxy-Authorization": true,
+	"Proxy-Connection": true, "Te": true, "Trailer": true, "Transfer-Encoding": true, "Upgrade": true, "User-Agent": true,
 }
 
 // styles lists the supported parameter styles per location; the first is
@@ -463,6 +557,7 @@ func (r *resolver) params(v any) []param {
 		r.fail(errors.New("parameters is not a list"))
 	}
 	var out []param
+	seen := map[[2]string]bool{}
 	for _, item := range list {
 		p := r.object(item)
 		if p == nil {
@@ -473,6 +568,17 @@ func (r *resolver) params(v any) []param {
 		if name == "" || in == "" {
 			r.fail(errors.New("a parameter has no name or location"))
 			continue
+		}
+		if seen[[2]string{in, name}] {
+			r.fail(fmt.Errorf("parameter %q in %s is declared twice", name, in))
+			continue
+		}
+		seen[[2]string{in, name}] = true
+		if strings.Contains(name, "=") {
+			r.fail(fmt.Errorf("parameter %q has '=' in its name, which a flag cannot carry", name))
+		}
+		if in == "header" && reservedHeaders[http.CanonicalHeaderKey(name)] {
+			r.fail(fmt.Errorf("header parameter %q is reserved: the CLI or HTTP sets it", name))
 		}
 		allowed, ok := styles[in]
 		if !ok {
@@ -501,7 +607,7 @@ func (r *resolver) params(v any) []param {
 		if !ok {
 			explode = style == "form"
 		}
-		array, object := r.schemaKind(p["schema"])
+		array, object := r.schemaKind(name, p["schema"])
 		switch {
 		case object:
 			r.fail(fmt.Errorf("parameter %q is an object", name))
@@ -517,8 +623,14 @@ func (r *resolver) params(v any) []param {
 }
 
 // schemaKind reports whether a parameter schema is an array or an object.
-func (r *resolver) schemaKind(v any) (array, object bool) {
+// Composed schemas are refused, since their shape is not one type.
+func (r *resolver) schemaKind(name string, v any) (array, object bool) {
 	s := r.object(v)
+	for _, k := range []string{"allOf", "oneOf", "anyOf", "not"} {
+		if _, ok := s[k]; ok {
+			r.fail(fmt.Errorf("parameter %q has a schema using %s", name, k))
+		}
+	}
 	is := func(want string) bool {
 		switch t := s["type"].(type) {
 		case string:

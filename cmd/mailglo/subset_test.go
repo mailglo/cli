@@ -55,12 +55,34 @@ func TestSupportedSubset(t *testing.T) {
 			"/s":       {`{"operationId":"S","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/A"}}]}`, "too long or circular"},
 			"/t":       {`{"operationId":"T","parameters":[{"name":"bad name","in":"header"}]}`, `header parameter "bad name" has an invalid name`},
 			"/u":       {`{"operationId":"U","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/A~2"}}]}`, "invalid ~ escape"},
+			// Round 3.
+			"/v1":      {`{"operationId":"V1","parameters":[{"name":"q","in":"query","schema":{"allOf":[{"type":"string"}]}}]}`, `parameter "q" has a schema using allOf`},
+			"/v2":      {`{"operationId":"V2","parameters":[{"name":"q","in":"query","schema":{"oneOf":[{"type":"string"},{"type":"object"}]}}]}`, "using oneOf"},
+			"/v3":      {`{"operationId":"V3","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/Any"}}]}`, "using anyOf"},
+			"/w1":      {`{"operationId":"W1","parameters":[{"name":"q","in":"query","schema":{"$ref":"#/components/schemas/Str","type":"array"}}]}`, `has sibling "type"`},
+			"/w2":      {`{"operationId":"W2","requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Str","required":["x"]}}}}}`, `has sibling "required"`},
+			"/w3":      {`{"operationId":"W3","parameters":[{"$ref":"#/components/parameters/P","description":"Overrides the text."}]}`, ""},
+			"/x1/{id}": {`{"operationId":"X1"}`, `parameter "id" in path is declared twice`},
+			"/y1":      {`{"operationId":"Y1","parameters":[{"name":"Host","in":"header"}]}`, `header parameter "Host" is reserved`},
+			"/y2":      {`{"operationId":"Y2","parameters":[{"name":"user-agent","in":"header"}]}`, `header parameter "user-agent" is reserved`},
+			"/y3":      {`{"operationId":"Y3","parameters":[{"name":"Cookie","in":"header"}]}`, "is reserved"},
+			"/y4":      {`{"operationId":"Y4","parameters":[{"name":"X-Trace","in":"header"}]}`, ""},
+			"/z1":      {`{"operationId":"Z1","parameters":[{"name":"a=b","in":"query"}]}`, `parameter "a=b" has '=' in its name`},
+			"/z2":      {`{"operationId":"Z2","parameters":[{"$ref":"#/paths/~1u/get/parameters/-0"}]}`, `invalid array index "-0"`},
+			"/z3":      {`{"operationId":"Z3","servers":[{"url":"{a}","variables":{"a":{"default":"{a}{a}"}}}]}`, `server variable "a" has braces in its default`},
 		}
 		var paths []string
 		for p, o := range ops {
-			paths = append(paths, fmt.Sprintf("%q:{\"get\":%s}", p, o.op))
+			level := ""
+			if p == "/x1/{id}" { // duplicate path-level parameters
+				level = `"parameters":[{"name":"id","in":"path"},{"name":"id","in":"path","required":true}],`
+			}
+			paths = append(paths, fmt.Sprintf("%q:{%s\"get\":%s}", p, level, o.op))
 		}
-		spec := `{"openapi":"3.0.3","components":{"schemas":{"A":{"$ref":"#/components/schemas/B"},"B":{"$ref":"#/components/schemas/A"}}},"paths":{` + strings.Join(paths, ",") + `}}`
+		spec := `{"openapi":"3.0.3","components":{
+			"parameters":{"P":{"name":"p","in":"query"}},
+			"schemas":{"A":{"$ref":"#/components/schemas/B"},"B":{"$ref":"#/components/schemas/A"},
+				"Str":{"type":"string"},"Any":{"anyOf":[{"type":"string"},{"type":"integer"}]}}},"paths":{` + strings.Join(paths, ",") + `}}`
 		srv := specServer(t, spec)
 		e := newEnv(t, srv.URL)
 		r := e.run(t, "operations")
@@ -319,7 +341,7 @@ func TestJSONPointerReferences(t *testing.T) {
 	want(t, e.run(t, "make"), 2) // the referenced body is required
 	r := e.run(t, "bad")
 	want(t, r, 2)
-	if !strings.Contains(r.Stderr, "does not resolve") {
+	if !strings.Contains(r.Stderr, `invalid array index "01"`) {
 		t.Fatalf("stderr %s", r.Stderr)
 	}
 }

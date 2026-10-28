@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,15 +44,7 @@ func bodyFlag(o *operation) string {
 	return "--request-body"
 }
 
-func paramsNamed(o *operation, name string) []int {
-	var out []int
-	for i, p := range o.Params {
-		if p.Name == name {
-			out = append(out, i)
-		}
-	}
-	return out
-}
+func paramsNamed(o *operation, name string) []int { return o.byName[name] }
 
 // resolveFlag maps a flag name to a parameter index, or to the body (-1).
 // In order: --request-body; --body unless a parameter is called body;
@@ -70,14 +63,8 @@ func resolveFlag(o *operation, key string) (int, error) {
 		return -1, nil
 	}
 	if in, name, ok := strings.Cut(key, "."); ok {
-		for _, loc := range locations {
-			if in == loc {
-				for i, p := range o.Params {
-					if p.In == in && p.Name == name {
-						return i, nil
-					}
-				}
-			}
+		if i, ok := o.byLoc[[2]string{in, name}]; ok {
+			return i, nil
 		}
 	}
 	switch idx := paramsNamed(o, key); len(idx) {
@@ -304,7 +291,7 @@ func call(base *url.URL, docURL string, o *operation, args []string, token strin
 	}
 	// Requests can carry the token, cookies and other credential headers,
 	// so no redirect may leave the server's origin.
-	client := &http.Client{Timeout: 60 * time.Second, CheckRedirect: sameOriginRedirects}
+	client := &http.Client{Timeout: 60 * time.Second, CheckRedirect: sameOriginRedirects, Transport: transport(base)}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fail(stderr, exitRetry, "request failed: "+err.Error())
@@ -372,20 +359,57 @@ func validCookieValue(s string) bool {
 }
 
 // safeForToken reports whether a bearer token may be sent to u: over https,
-// or over plain http only to this machine.
+// or over plain http only to this machine, named as localhost or a literal
+// loopback address.
 func safeForToken(u *url.URL) bool {
 	if u.Scheme == "https" {
 		return true
 	}
-	if u.Scheme != "http" {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+	return u.Scheme == "http" && isLoopbackHost(u.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// transport returns the HTTP transport for API requests to base. Plain http
+// to this machine never goes through a proxy, and connects only to loopback
+// addresses, so nothing on the network sees the request.
+func transport(base *url.URL) http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	if base.Scheme == "http" && isLoopbackHost(base.Hostname()) {
+		t.Proxy = nil
+		t.DialContext = dialLoopback
+	}
+	return t
+}
+
+func dialLoopback(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var d net.Dialer
+	last := fmt.Errorf("%s has no loopback address", host)
+	for _, ip := range ips {
+		if !ip.IP.IsLoopback() {
+			continue
+		}
+		c, err := d.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	return nil, last
 }
 
 func exitCode(status int) int {

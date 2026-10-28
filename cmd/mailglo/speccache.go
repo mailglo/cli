@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,15 +25,23 @@ import (
 
 const maxSpecBytes = 64 << 20
 
+// A cache file is one line of JSON metadata, a newline, then the
+// description exactly as the server sent it. Every description the CLI
+// accepts therefore fits within the read limit.
+const (
+	maxMetaBytes  = 64 << 10
+	maxCacheBytes = maxMetaBytes + maxSpecBytes
+)
+
 type cachedSpec struct {
 	Server string `json:"server"`
 	// URL is where the description was finally fetched from, after
 	// same-origin redirects; relative server URLs resolve against it.
-	URL          string          `json:"url"`
-	ETag         string          `json:"etag,omitempty"`
-	LastModified string          `json:"last_modified,omitempty"`
-	FetchedAt    time.Time       `json:"fetched_at"`
-	Spec         json.RawMessage `json:"spec"`
+	URL          string    `json:"url"`
+	ETag         string    `json:"etag,omitempty"`
+	LastModified string    `json:"last_modified,omitempty"`
+	FetchedAt    time.Time `json:"fetched_at"`
+	Spec         []byte    `json:"-"`
 }
 
 // parseServer checks a server URL and returns it without a trailing slash.
@@ -137,12 +146,20 @@ func (c *specCache) read(server string, stderr io.Writer) *cachedSpec {
 	if err := trustedFile(fi); err != nil {
 		return ignore(err)
 	}
-	b, err := io.ReadAll(io.LimitReader(f, 2*maxSpecBytes))
+	b, err := io.ReadAll(io.LimitReader(f, maxCacheBytes+1))
 	if err != nil {
 		return ignore(err)
 	}
+	if len(b) > maxCacheBytes {
+		return ignore(errors.New("the file is too large"))
+	}
+	meta, spec, ok := bytes.Cut(b, []byte("\n"))
 	var cs cachedSpec
-	if json.Unmarshal(b, &cs) != nil || cs.Server != server || validSpec(cs.Spec) != nil {
+	if !ok || len(meta) > maxMetaBytes || json.Unmarshal(meta, &cs) != nil || cs.Server != server {
+		return nil
+	}
+	cs.Spec = spec
+	if validSpec(cs.Spec) != nil {
 		return nil
 	}
 	if u, err := url.Parse(cs.URL); err != nil || !sameOrigin(u, mustParse(server)) {
@@ -152,10 +169,17 @@ func (c *specCache) read(server string, stderr io.Writer) *cachedSpec {
 }
 
 func (c *specCache) write(cs *cachedSpec) error {
-	b, err := json.Marshal(cs)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(cs); err != nil { // one line, ending in a newline
 		return err
 	}
+	if buf.Len() > maxMetaBytes {
+		return errors.New("the response headers are too large to cache")
+	}
+	buf.Write(cs.Spec)
+	b := buf.Bytes()
 	tmp := ".spec-" + rand.Text()
 	f, err := c.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|noFollow, 0o600)
 	if err != nil {
