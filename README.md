@@ -1,7 +1,7 @@
-# Mailglo CLI
+# MailGlo CLI
 
-`mailglo` runs any Mailglo API operation from a terminal, a script or an AI agent. It
-uses the same permissions as the Mailglo web app and prints JSON.
+`mailglo` runs any MailGlo API operation from a terminal, a script or an AI agent. It
+uses the same permissions as the MailGlo web app and prints JSON.
 
 You do not need a new CLI release when the API gains an operation. The CLI reads its
 commands from the server's API description (the OpenAPI document at
@@ -15,17 +15,32 @@ commands from the server's API description (the OpenAPI document at
 brew install --cask mailglo/tap/mailglo
 ```
 
-**Release download**: get the archive for your system from
-[Releases](https://github.com/mailglo/cli/releases), check it against
-`checksums.txt`, and put `mailglo` on your `PATH`:
+**Release download**: from [Releases](https://github.com/mailglo/cli/releases),
+download the archive for your system and `checksums.txt` into one folder. In that
+folder, check the archive and put `mailglo` on your `PATH`:
+
+Set `VERSION` to the release you downloaded, without the `v`, such as `VERSION=0.1.0`.
+
+On Linux (use `arm64` in place of `amd64` on an ARM machine):
 
 ```sh
-sha256sum --ignore-missing -c checksums.txt   # macOS: shasum -a 256 --ignore-missing -c checksums.txt
-tar -xzf mailglo_*_linux_amd64.tar.gz mailglo
-sudo install mailglo /usr/local/bin/
+f=mailglo_${VERSION}_linux_amd64.tar.gz &&
+  grep "  $f\$" checksums.txt | sha256sum -c - &&
+  tar -xzf "$f" mailglo &&
+  sudo install mailglo /usr/local/bin/
 ```
 
-The macOS binaries are signed with a Developer ID and notarized by Apple.
+On a Mac (use `amd64` in place of `arm64` on an Intel Mac):
+
+```sh
+f=mailglo_${VERSION}_darwin_arm64.tar.gz &&
+  grep "  $f\$" checksums.txt | shasum -a 256 -c - &&
+  tar -xzf "$f" mailglo &&
+  sudo install mailglo /usr/local/bin/
+```
+
+If the checksum does not match, nothing is extracted or installed. The macOS binaries
+are signed with a Developer ID and notarized by Apple.
 
 **From source** (Go 1.26 or later):
 
@@ -35,7 +50,7 @@ go install github.com/mailglo/cli/cmd/mailglo@latest
 
 ## Authenticate
 
-Create an API token in your Mailglo workspace and export it:
+Create an API token in your MailGlo workspace and export it:
 
 ```sh
 export MAILGLO_TOKEN=...
@@ -92,7 +107,7 @@ the `--cursor` value for the next page.
 
 ## Supported API descriptions
 
-`mailglo` is built for the Mailglo API description, not for every OpenAPI document.
+`mailglo` is built for the MailGlo API description, not for every OpenAPI document.
 It reads the description with [kin-openapi](https://github.com/getkin/kin-openapi),
 which loads it, resolves its references and validates it, and then accepts this
 subset:
