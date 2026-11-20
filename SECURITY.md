@@ -15,7 +15,7 @@ Security fixes go into the latest release. Upgrade to it before you report.
 ## Scope
 
 This repository covers the `mailglo` command-line client. Report issues in the
-Mailglo service itself to the same address.
+MailGlo service itself to the same address.
 
 ## Threat model
 

@@ -63,7 +63,7 @@ homebrew_casks:
     ids: [mailglo]
     binaries: [mailglo]
     homepage: https://mailglo.com
-    description: Command-line client for the Mailglo API
+    description: Command-line client for the MailGlo API
     license: Apache-2.0
     repository:
       owner: mailglo

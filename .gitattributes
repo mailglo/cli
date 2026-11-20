@@ -1,0 +1,3 @@
+# Keep bundled licence texts byte-identical to the module copies the
+# licence test compares them with, on every platform.
+licenses/** -text

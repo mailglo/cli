@@ -1,4 +1,4 @@
-// Command mailglo calls the Mailglo API from a terminal, a script or an agent.
+// Command mailglo calls the MailGlo API from a terminal, a script or an agent.
 // It reads the list of operations from the server's OpenAPI description, so
 // every API operation is available with the same permissions as the web app.
 //
@@ -46,7 +46,7 @@ flags:
 
 environment:
   MAILGLO_URL    server URL (default ` + defaultServer + `); --server overrides it
-  MAILGLO_TOKEN  API token from your Mailglo workspace`
+  MAILGLO_TOKEN  API token from your MailGlo workspace`
 
 // Exit codes.
 const (
